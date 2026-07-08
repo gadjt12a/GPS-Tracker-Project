@@ -1,0 +1,9 @@
+# Valtrack OTA partition table — 2MB flash
+# NVS kept at same offset/size as original single-app layout to preserve BT-configured params.
+# App partitions must be 0x10000 (64KB) aligned; ota_0 starts at 0x20000 (wastes 56KB but required).
+# Name,   Type, SubType, Offset,  Size,    Flags
+nvs,      data, nvs,     0x9000,  0x6000,
+otadata,  data, ota,     0xf000,  0x2000,
+phy_init, data, phy,     0x11000, 0x1000,
+ota_0,    app,  ota_0,   0x20000, 0xF0000,
+ota_1,    app,  ota_1,   0x110000,0xF0000,

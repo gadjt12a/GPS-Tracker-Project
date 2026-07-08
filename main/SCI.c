@@ -19,6 +19,7 @@
 
 
 unsigned char DebugPrintEnabled=0;
+TaskHandle_t uart_event_task_handle = NULL;
 extern unsigned char WatchTimer;
 char Buff[BUFF_SIZE],Buff2[BUFF2_SIZE];
 unsigned short BuffIndex = 0,Buff2Index = 0;
@@ -226,7 +227,7 @@ void InitUART(void)
     uart_pattern_queue_reset(UART_PORT_NUM, 20);
 
     //Create a task to handler UART event from ISR
-    xTaskCreate(uart_event_task, "uart_event_task", 2048, NULL, 12, NULL);
+    xTaskCreate(uart_event_task, "uart_event_task", 2048, NULL, 12, &uart_event_task_handle);
 }
 
 

@@ -41,6 +41,8 @@
 // #include "driver/adc.h"
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
+#include "esp_ota_ops.h"
+extern TaskHandle_t uart_event_task_handle;
 
 
 #define BTBUFF_SIZE 500
@@ -1063,6 +1065,7 @@ int GetLength(char *p)
   
 }
 void WakeUp(void);
+void CheckAndApplyOTA(void);
 
 
 
@@ -4321,7 +4324,8 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     //DelayProc(850000);
     goto SUCCESS;
     //free(string);
-SUCCESS: 
+SUCCESS:
+    esp_ota_mark_app_valid_cancel_rollback();
     ClearEventCache();
     if(RFIDDataPresent==1)
     {
@@ -6372,6 +6376,7 @@ ESP_LOGI(TAG,"Entered main task");
     //GetNetworkData();
     //
     SyncRTC();
+    CheckAndApplyOTA();
     InitRTCAlarm();
     ADCRunning = 0;
     Count=0;
@@ -7402,6 +7407,305 @@ ESP_LOGI(TAG,"Entered main task");
 //  }
   /* USER CODE END 5 */ 
 }
+// =========================================================
+// Phase 8 — OTA Firmware Update
+// Downloads firmware.bin in OTA_CHUNK_SIZE Range requests.
+// uart_event_task is suspended only during the binary read
+// of each chunk so uart_read_bytes() gets unfiltered bytes.
+// =========================================================
+
+// Read bytes directly from UART (task suspended) until the
+// "+HTTPREAD: N\r\n" header arrives; returns N, or -1 on timeout.
+static int ota_read_httpread_header(uint32_t timeout_ms)
+{
+    char hbuf[64] = {0};
+    int  hlen = 0;
+    bool in_digits = false;
+    uint32_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+
+    while (xTaskGetTickCount() < deadline) {
+        uint8_t b;
+        if (uart_read_bytes(UART_PORT_NUM, &b, 1, pdMS_TO_TICKS(100)) != 1) continue;
+
+        // Accumulate into a small rolling window to detect "+HTTPREAD: "
+        hbuf[hlen % sizeof(hbuf)] = (char)b;
+        hlen++;
+
+        if (!in_digits) {
+            // Look for "+HTTPREAD: " (11 chars) in recent bytes
+            if (hlen >= 11) {
+                int tail = (hlen - 11) % (int)sizeof(hbuf);
+                char win[12] = {0};
+                for (int i = 0; i < 11; i++)
+                    win[i] = hbuf[(tail + i) % sizeof(hbuf)];
+                if (memcmp(win, "+HTTPREAD: ", 11) == 0) {
+                    in_digits = true;
+                    hlen = 0; // repurpose buffer to collect the number
+                    memset(hbuf, 0, sizeof(hbuf));
+                }
+            }
+        } else {
+            // Collecting the decimal number until \r\n
+            if (hlen < (int)sizeof(hbuf))
+                hbuf[hlen - 1] = (char)b;
+            if (b == '\n' && hlen >= 2) {
+                // Null-terminate and parse
+                for (int i = (int)sizeof(hbuf) - 1; i >= 0; i--) {
+                    if (hbuf[i] == '\r' || hbuf[i] == '\n') hbuf[i] = '\0';
+                }
+                return atoi(hbuf);
+            }
+        }
+    }
+    return -1;
+}
+
+// Read exactly n binary bytes directly from UART into buf.
+static bool ota_read_exact(uint8_t *buf, int n, uint32_t timeout_ms)
+{
+    int got = 0;
+    uint32_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (got < n) {
+        if (xTaskGetTickCount() >= deadline) return false;
+        int r = uart_read_bytes(UART_PORT_NUM, buf + got, n - got, pdMS_TO_TICKS(500));
+        if (r > 0) got += r;
+    }
+    return true;
+}
+
+// Bring up PDP context for OTA (mirrors the setup in XHTTP_Request).
+static bool ota_network_up(void)
+{
+    sprintf(str, "AT+CGDCONT=1,\"IP\",\"%s\"\r\n", Params.Fields.APNName);
+    SendATCommand(str, "OK", "ERROR", 5);
+    SendATCommand("AT+CGACT=1,1\r\n", "OK", "ERROR", 10);
+    return SendATCommand("AT+CGACT?\r\n", "+CGACT: 1,1", "ERROR", 10) == 1;
+}
+
+// Open HTTP session for the given URL (no Range).
+static void ota_http_open(const char *url)
+{
+    ResetBuffer();
+    Print("AT+HTTPINIT\r\n");
+    LoopTimeout1 = 0;
+    while (1) {
+        if (MapForward(Buff2, BUFF2_SIZE, (char*)"OK",    2) != NULL) break;
+        if (MapForward(Buff2, BUFF2_SIZE, (char*)"ERROR", 5) != NULL || LoopTimeout1 > 30) break;
+    }
+    ResetBuffer();
+    Print("AT+HTTPPARA=\"CID\",1\r\n");
+    LoopTimeout1 = 0;
+    while (1) {
+        if (MapForward(Buff2, BUFF2_SIZE, (char*)"OK",    2) != NULL) break;
+        if (MapForward(Buff2, BUFF2_SIZE, (char*)"ERROR", 5) != NULL || LoopTimeout1 > 30) break;
+    }
+    ResetBuffer();
+    snprintf(str, sizeof(str), "AT+HTTPPARA=\"URL\",\"%s\"\r\n", url);
+    Print(str);
+    LoopTimeout1 = 0;
+    while (1) {
+        if (MapForward(Buff2, BUFF2_SIZE, (char*)"OK",    2) != NULL) break;
+        if (MapForward(Buff2, BUFF2_SIZE, (char*)"ERROR", 5) != NULL || LoopTimeout1 > 30) break;
+    }
+}
+
+static void ota_http_close(void)
+{
+    ResetBuffer();
+    Print("AT+HTTPTERM\r\n");
+    LoopTimeout1 = 0;
+    while (1) {
+        if (MapForward(Buff2, BUFF2_SIZE, (char*)"OK",    2) != NULL) break;
+        if (MapForward(Buff2, BUFF2_SIZE, (char*)"ERROR", 5) != NULL || LoopTimeout1 > 30) break;
+    }
+}
+
+// Trigger GET and return Content-Length from +HTTPACTION, or -1.
+static int ota_http_action_size(void)
+{
+    ResetBuffer();
+    Print("AT+HTTPACTION=0\r\n");
+    LoopTimeout1 = 0;
+    while (1) {
+        if (MapForward(Buff2, BUFF2_SIZE, (char*)"ACTION:", 7) != NULL) break;
+        if (MapForward(Buff2, BUFF2_SIZE, (char*)"ERROR",   5) != NULL || LoopTimeout1 > 60) return -1;
+    }
+    osDelay(300);
+    // +HTTPACTION: 0,<code>,<size>
+    char *p = MapForward(Buff2, BUFF2_SIZE, (char*)"+HTTPACTION:", 12);
+    if (!p) return -1;
+    int commas = 0;
+    while (*p && commas < 3) { if (*p++ == ',') commas++; }
+    return (*p) ? atoi(p) : -1;
+}
+
+// Parse {"ver":"X.Y.Z"} from Buff2; copies version string into out[maxlen].
+static bool ota_parse_version(char *out, int maxlen)
+{
+    const char *key = "\"ver\":\"";
+    char *p = MapForward(Buff2, BUFF2_SIZE, (char*)key, (unsigned short)strlen(key));
+    if (!p) return false;
+    p += strlen(key);
+    char *end = p;
+    while (end < Buff2 + BUFF2_SIZE && *end != '"' && *end != '\0') end++;
+    int len = (int)(end - p);
+    if (len <= 0 || len >= maxlen) return false;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return true;
+}
+
+void CheckAndApplyOTA(void)
+{
+    char server_ver[32]  = {0};
+    esp_ota_handle_t ota_handle = 0;
+    esp_err_t        err;
+    uint8_t         *chunk_buf = NULL;
+    bool             ota_begun = false;
+
+    ESP_LOGI(TAG, "OTA: check %s (running %s)", OTA_VERSION_URL, FW_VERSION);
+
+    if (!ota_network_up()) {
+        ESP_LOGW(TAG, "OTA: PDP context failed, skipping");
+        return;
+    }
+
+    // ---- Step 1: fetch version.json ----
+    ota_http_open(OTA_VERSION_URL);
+    if (ota_http_action_size() < 0) goto ota_abort;
+    osDelay(500);
+    ResetBuffer();
+    SendATCommand("AT+HTTPREAD=0,200\r\n", "+HTTPREAD:", "ERROR", 10);
+    osDelay(300);
+    if (!ota_parse_version(server_ver, sizeof(server_ver))) goto ota_abort;
+    ota_http_close();
+
+    ESP_LOGI(TAG, "OTA: running=%s server=%s", FW_VERSION, server_ver);
+    if (strcmp(FW_VERSION, server_ver) == 0) {
+        ESP_LOGI(TAG, "OTA: up to date");
+        return;
+    }
+    ESP_LOGI(TAG, "OTA: update available, downloading...");
+
+    // ---- Step 2: determine firmware size ----
+    ota_http_open(OTA_FIRMWARE_URL);
+    int firmware_size = ota_http_action_size();
+    ota_http_close();
+
+    if (firmware_size <= 0 || firmware_size > (int)OTA_MAX_FIRMWARE) {
+        ESP_LOGE(TAG, "OTA: bad firmware size %d", firmware_size);
+        return;
+    }
+
+    // ---- Step 3: begin OTA write ----
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+    if (!next) { ESP_LOGE(TAG, "OTA: no OTA partition"); return; }
+
+    err = esp_ota_begin(next, firmware_size, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: begin failed %s", esp_err_to_name(err));
+        return;
+    }
+    ota_begun = true;
+
+    chunk_buf = (uint8_t*)heap_caps_malloc(OTA_CHUNK_SIZE, MALLOC_CAP_DEFAULT);
+    if (!chunk_buf) { ESP_LOGE(TAG, "OTA: malloc failed"); goto ota_abort; }
+
+    // ---- Step 4: download in OTA_CHUNK_SIZE Range chunks ----
+    int offset = 0;
+    while (offset < firmware_size) {
+        int end_byte   = offset + OTA_CHUNK_SIZE - 1;
+        if (end_byte >= firmware_size) end_byte = firmware_size - 1;
+        int this_chunk = end_byte - offset + 1;
+
+        // Open HTTP with Range header for this chunk
+        ota_http_open(OTA_FIRMWARE_URL);
+        ResetBuffer();
+        snprintf(str, sizeof(str),
+                 "AT+HTTPPARA=\"USERDATA\",\"Range: bytes=%d-%d\"\r\n",
+                 offset, end_byte);
+        Print(str);
+        LoopTimeout1 = 0;
+        while (1) {
+            if (MapForward(Buff2, BUFF2_SIZE, (char*)"OK",    2) != NULL) break;
+            if (MapForward(Buff2, BUFF2_SIZE, (char*)"ERROR", 5) != NULL || LoopTimeout1 > 30) goto ota_abort;
+        }
+        // Trigger the range request; modem fetches this_chunk bytes
+        ResetBuffer();
+        Print("AT+HTTPACTION=0\r\n");
+        LoopTimeout1 = 0;
+        int got_size = -1;
+        while (1) {
+            if (MapForward(Buff2, BUFF2_SIZE, (char*)"ACTION:", 7) != NULL) {
+                osDelay(300);
+                char *p = MapForward(Buff2, BUFF2_SIZE, (char*)"+HTTPACTION:", 12);
+                if (p) {
+                    int c = 0;
+                    while (*p && c < 3) { if (*p++ == ',') c++; }
+                    got_size = atoi(p);
+                }
+                break;
+            }
+            if (MapForward(Buff2, BUFF2_SIZE, (char*)"ERROR", 5) != NULL || LoopTimeout1 > 60)
+                goto ota_abort;
+        }
+        if (got_size != this_chunk) {
+            ESP_LOGE(TAG, "OTA: chunk size mismatch exp=%d got=%d", this_chunk, got_size);
+            goto ota_abort;
+        }
+
+        // Suspend uart_event_task and take UART exclusively for binary read
+        vTaskSuspend(uart_event_task_handle);
+        uart_flush_input(UART_PORT_NUM);
+
+        // Send AT+HTTPREAD and read binary payload directly
+        snprintf(str, sizeof(str), "AT+HTTPREAD=0,%d\r\n", this_chunk);
+        uart_write_bytes(UART_PORT_NUM, str, strlen(str));
+
+        int header_n = ota_read_httpread_header(10000);
+        bool read_ok = (header_n == this_chunk) &&
+                       ota_read_exact(chunk_buf, this_chunk, 30000);
+
+        vTaskResume(uart_event_task_handle);
+
+        if (!read_ok) {
+            ESP_LOGE(TAG, "OTA: binary read failed at offset %d", offset);
+            ota_http_close();
+            goto ota_abort;
+        }
+
+        ota_http_close();
+
+        err = esp_ota_write(ota_handle, chunk_buf, this_chunk);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA: write failed %s", esp_err_to_name(err));
+            goto ota_abort;
+        }
+
+        offset += this_chunk;
+        ESP_LOGI(TAG, "OTA: %d/%d bytes", offset, firmware_size);
+    }
+
+    // ---- Step 5: commit and reboot ----
+    if (esp_ota_end(ota_handle) != ESP_OK ||
+        esp_ota_set_boot_partition(next) != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: commit failed");
+        ota_begun = false; // already ended, don't abort again
+        goto ota_abort;
+    }
+
+    free(chunk_buf);
+    ESP_LOGI(TAG, "OTA: complete — rebooting into new firmware");
+    esp_restart();
+    return;  // unreachable
+
+ota_abort:
+    if (ota_begun) esp_ota_abort(ota_handle);
+    if (chunk_buf) free(chunk_buf);
+    ota_http_close();
+    ESP_LOGW(TAG, "OTA: aborted, continuing with current firmware");
+}
+
 void InitFlash(void)
 {
     esp_err_t err;

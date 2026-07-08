@@ -181,6 +181,15 @@ extern const char *TAG;
 #define PARK_LONG_SECONDS 172800UL   // 48 hours — threshold to enter deep sleep
 #define HEART_BEAT_INTERVAL (8*3600) // 8hr deep-sleep heartbeat wakeup
 
+// OTA firmware update
+#define FW_VERSION          "2.1.0"
+#define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
+#define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
+#define OTA_CHUNK_SIZE      4096
+#define OTA_MAX_FIRMWARE    0xEE000  // must fit in one OTA partition
+
+// uart_event_task_handle declared in SCI.c; extern in main.c (see OTA functions)
+
 #define BLUETOOTH_ENABLED
 
 //#define BATTERY_PRESENT
