@@ -18,8 +18,6 @@ Based on the original firmware by [Valetron Systems](https://www.valetron.com/).
 
 The original Valetron firmware sends a proprietary JSON POST to a GPS-Gate or Valetron-compatible server. This is not natively understood by Traccar.
 
-Three modifications were made to `main/main.c`:
-
 ### 1. OsmAnd HTTP protocol (replaces native JSON POST)
 The HTTP reporting function was changed to emit an OsmAnd-format GET request:
 ```
@@ -33,8 +31,21 @@ http://<server>:5055/?id=<IMEI>&lat=<lat>&lon=<lon>&speed=<speed>&timestamp=<uni
 ### 2. No-fix guard
 Prevents the device from sending reports when the GNSS module has no fix (lat/lon = 0,0). This avoids wasting SIM data and stops invalid positions and year-2019 timestamps accumulating in Traccar.
 
-### 3. BLE device name fix
-The BLE GAP initialisation order was corrected so the device advertises as `VALTRACK-V4-VTS` rather than the NimBLE default name `nimble`. This allows the Valetron BT config app to find and configure the device correctly.
+### 3. BLE device name with IMEI suffix
+The BLE GAP initialisation order was corrected and the device now advertises as `VALTRACK-V4-VTS-XXXX` (last 4 digits of IMEI). This allows identifying individual units via BLE scan without a serial cable, and lets the Valetron config app find the device correctly.
+
+### 4. Adaptive reporting + deep sleep (Phase 7a)
+Three-tier power/reporting state machine driven by the onboard LIS3DH accelerometer (INT1 motion interrupt on GPIO 3):
+
+| State | Condition | Report interval | Power |
+|---|---|---|---|
+| Moving | Motion within last 5 min | 30 s (configured via BT app) | Normal |
+| Parked short | No motion 5 min – 48 hr | 5 min | Modem light sleep between reports |
+| Parked long | No motion ≥ 48 hr | Deep sleep + 8 hr heartbeat | ~negligible |
+
+- On each heartbeat wakeup (8 hr timer), the device sends one position report then returns to deep sleep
+- Motion during deep sleep (LIS3DH INT1 asserted low) wakes the device and resumes normal reporting immediately
+- The 48 hr threshold is intentional: a daily driver parked Friday–Monday stays in parked-short mode over the weekend rather than entering deep sleep mid-weekend
 
 ---
 
