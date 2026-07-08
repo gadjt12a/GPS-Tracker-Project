@@ -690,6 +690,7 @@ unsigned char ImageSent = 0, ImageIndex = 0,ImagePresent=0,SendingImageIndex=0,I
 //IDPacketType DeviceID;
 GeneralEventType GEvent;
 char IMEI[16],IMSI[16],/*time[21],ctime[21],*/etype,*presult,bac,filename[32];
+char ble_device_name[32];
 //PackedGeneralEventType PGEvent;
 HWEventDataType CPacket,GPacket;
 const char dummyevent[]={"0D00000000000000000033002300000000"};
@@ -2546,7 +2547,11 @@ unsigned char InitGSM(void)
             IMEI[i] = pToken[i+1];
         }
         IMEI[15] = '\0';
-    } 
+        snprintf(ble_device_name, sizeof(ble_device_name), "%s-%.4s", TAG, &IMEI[11]);
+        ble_svc_gap_device_name_set(ble_device_name);
+        ble_gap_adv_stop();
+        ble_app_advertise();
+    }
 
     SendATCommand("AT+CIMI\r\n","OK","ERROR",5);
     pToken = MapForward(Buff2,BUFF2_SIZE,(char*)"\n",1);
@@ -7402,7 +7407,7 @@ void app_main(void)
     //esp_nimble_hci_and_controller_init();      // 2 - Initialize ESP controller
     nimble_port_init();                        // 3 - Initialize the host stack
     ble_svc_gap_init();                        // 4 - Initialize NimBLE configuration - gap service
-    ble_svc_gap_device_name_set(TAG); // 4 - Set device name AFTER gap init (gap init resets to default)
+    ble_svc_gap_device_name_set(ble_device_name[0] ? ble_device_name : TAG); // 4 - Set device name AFTER gap init (gap init resets to default)
     ble_svc_gatt_init();                       // 4 - Initialize NimBLE configuration - gatt service
     ble_gatts_count_cfg(gatt_svcs);            // 4 - Initialize NimBLE configuration - config gatt services
     ble_gatts_add_svcs(gatt_svcs);             // 4 - Initialize NimBLE configuration - queues gatt services.
