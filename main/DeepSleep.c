@@ -238,16 +238,15 @@ void EnterDeepSleep(void)
 #endif // CONFIG_EXAMPLE_EXT1_WAKEUP
 
 #ifdef CONFIG_EXAMPLE_GPIO_WAKEUP
-    // const gpio_config_t config = {
-    //     .pin_bit_mask = BIT(DEFAULT_WAKEUP_PIN),
-    //     .mode = GPIO_MODE_INPUT,
-    // };
-    // ESP_ERROR_CHECK(gpio_config(&config));
-    // ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(BIT(DEFAULT_WAKEUP_PIN), DEFAULT_WAKEUP_LEVEL));
-    // ESP_LOGI(TAG,"Enabling GPIO wakeup on pins GPIO%d\n", DEFAULT_WAKEUP_PIN);
-
-    /* GPIO wakeup from deep sleep not used on ESP32-C3 (ext0/ext1 not supported) */
-    ESP_LOGI(TAG,"Enabling GPIO wakeup on pins GPIO%d\n", GPIO_INT1);
+    #if SOC_GPIO_SUPPORT_HP_PERIPH_PD_SLEEP_WAKEUP
+    {
+        /* ESP32-C3: use hp-periph-powerdown GPIO wakeup for deep sleep.
+           LIS3DH INT1 is active-low, so wake on GPIO going LOW. */
+        ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(
+            BIT(DEFAULT_WAKEUP_PIN), DEFAULT_WAKEUP_LEVEL));
+        ESP_LOGI(TAG,"Enabling deep sleep GPIO wakeup on pin GPIO%d (INT1, active low)\n", DEFAULT_WAKEUP_PIN);
+    }
+    #endif // SOC_GPIO_SUPPORT_HP_PERIPH_PD_SLEEP_WAKEUP
 
 
     

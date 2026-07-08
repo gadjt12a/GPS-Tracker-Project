@@ -178,7 +178,8 @@ extern const char *TAG;
 
 
 #define TIME_TO_SLEEP 300
-#define HEART_BEAT_INTERVAL 6*3600
+#define PARK_LONG_SECONDS 172800UL   // 48 hours — threshold to enter deep sleep
+#define HEART_BEAT_INTERVAL (8*3600) // 8hr deep-sleep heartbeat wakeup
 
 #define BLUETOOTH_ENABLED
 

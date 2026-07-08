@@ -519,6 +519,8 @@ unsigned short SystemTimer;
 unsigned short InactivityTimer;
 unsigned long  IntervalTimer;
 unsigned short MotionTimer=0;
+uint32_t ParkLongTimer = 0;      // seconds since last motion; 48hr threshold → deep sleep
+static int heartbeat_wake = 0;   // 1 when woken by 8hr timer; cleared after first ping
 unsigned short HeartBeatTimer = 0;
 unsigned short NoSignalTimer=0;
 unsigned short ButtonPressTimer=0;
@@ -868,8 +870,8 @@ void InitAccelerometer_LIS3D(void)
     I2C_WrReg(REG_INT1_THS,Params.Fields.MotionThreshold);
     I2C_WrReg(REG_INT1_DURATION,0x00);
     I2C_WrReg(REG_INT1_CFG,0x2A);
-    
-    
+    I2C_RdReg(REG_INT1_SRC); // Clear any latched interrupt so INT1 pin is de-asserted before sleep
+
      for(i=0x07;i<=0x3F;i++)
     {
        ReadBuff[i] = I2C_RdReg(i);
@@ -2786,7 +2788,8 @@ void StartTimerTask(void *argument)
     {
         #ifndef TIMER_ONLY_WAKEUP
             MotionTimer=0;
-        
+            ParkLongTimer = 0;
+
             #ifdef VALTRACK_V4_VTS
                 if(FrontPanelTimer > 120)
                 {
@@ -2807,6 +2810,8 @@ void StartTimerTask(void *argument)
         IntervalTimer++;
         #ifndef TIMER_ONLY_WAKEUP
         MotionTimer++;
+        if (ParkLongTimer <= PARK_LONG_SECONDS)
+            ParkLongTimer++;
         #endif
 //        #ifndef MOTION_CONTROLLED_PINGS
 //        MotionTimer=0;
@@ -2846,19 +2851,30 @@ void StartTimerTask(void *argument)
         {
            //VALTRACK_BLE_Advertise(0); //TBD
         }
-        if(IntervalTimer > Params.Fields.PingInterval && ChargingStatus == DISCONNECTED)
         {
-            #ifdef MOTION_CONTROLLED_PINGS
-                if(MotionTimer<TIME_TO_SLEEP)
-                {
-                        
+            // Moving: Params.Fields.PingInterval (30s from BT app)
+            // Parked short (5min–48hr): TIME_TO_SLEEP (300s = 5min)
+            // Heartbeat wake: use fast interval for the one ping before re-sleeping
+            uint32_t effectiveInterval = (ParkLongTimer < TIME_TO_SLEEP || heartbeat_wake)
+                ? Params.Fields.PingInterval
+                : TIME_TO_SLEEP;
+            if(IntervalTimer > effectiveInterval && ChargingStatus == DISCONNECTED)
+            {
+                #ifdef MOTION_CONTROLLED_PINGS
+                    if(MotionTimer < TIME_TO_SLEEP
+                       || ParkLongTimer < PARK_LONG_SECONDS
+                       || heartbeat_wake)
+                    {
+                        PostGPing();
+                        heartbeat_wake = 0;
+                    }
+                #else
                     PostGPing();
-                }
-            #else
-                PostGPing();
-            #endif
-           
-            IntervalTimer = 0;
+                    heartbeat_wake = 0;
+                #endif
+
+                IntervalTimer = 0;
+            }
         }
         #ifdef LPUART_TIMER_RESET_ENABLED
         // If no events and no cache means nothing to send so timer expire is not valid
@@ -5909,7 +5925,7 @@ void DeepSleep (void)
     
     if((Params.Fields.WorkingMode[0]=='T'  || Params.Fields.WorkingMode[0]=='H') || PowerButtonSleep == 1)
     {
-      if(((MotionTimer > TIME_TO_SLEEP) /*&& (IsQueueEmpty(RAMQueue)==0)*/) || PowerButtonSleep == 1)
+      if((ParkLongTimer >= PARK_LONG_SECONDS) || PowerButtonSleep == 1)
         {
 //            if(GSMEnabled == 1)
 //            {    
@@ -7415,6 +7431,12 @@ void app_main(void)
     nimble_port_freertos_init(host_task);      // 6 - Run the thread
     //
     SleepWakeupReason();
+    // Timer wakeup = 8hr heartbeat from parked-long deep sleep.
+    // Set ParkLongTimer to threshold so DeepSleep() fires after one ping.
+    if (esp_sleep_get_wakeup_causes() & (1ULL << ESP_SLEEP_WAKEUP_TIMER)) {
+        ParkLongTimer = PARK_LONG_SECONDS;
+        heartbeat_wake = 1;
+    }
     // osDelay(5000);
     // DisableGSM();
     // DisableMainPower();
