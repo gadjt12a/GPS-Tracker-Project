@@ -21,6 +21,7 @@
 #include "esp_log.h"
 #include "driver/rtc_io.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "soc/rtc.h"
 #include "SCI.h"
 
@@ -245,23 +246,7 @@ void EnterDeepSleep(void)
     // ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(BIT(DEFAULT_WAKEUP_PIN), DEFAULT_WAKEUP_LEVEL));
     // ESP_LOGI(TAG,"Enabling GPIO wakeup on pins GPIO%d\n", DEFAULT_WAKEUP_PIN);
 
-     const gpio_config_t config1 = {
-        .pin_bit_mask = BIT(GPIO_INT1),
-        .mode = GPIO_MODE_INPUT,
-    };
-    ESP_ERROR_CHECK(gpio_config(&config1));
-    //ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(BIT(GPIO_INT1), DEFAULT_WAKEUP_LEVEL));
-    // gpio_sleep_set_direction(GPIO_NUM_3, GPIO_MODE_INPUT); 
-    // osDelay(100);
-    // gpio_sleep_set_pull_mode(GPIO_NUM_3, GPIO_FLOATING);
-    // osDelay(100);
-    // ESP_ERROR_CHECK(gpio_wakeup_enable(BIT(GPIO_INT1),GPIO_INTR_LOW_LEVEL));
-    // osDelay(100);
-    // ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
-
-    
-    
-    ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(BIT(GPIO_INT1), DEFAULT_WAKEUP_LEVEL));
+    /* GPIO wakeup from deep sleep not used on ESP32-C3 (ext0/ext1 not supported) */
     ESP_LOGI(TAG,"Enabling GPIO wakeup on pins GPIO%d\n", GPIO_INT1);
 
 

@@ -34,7 +34,7 @@
 //ADC1 Channels
 
 #define EXAMPLE_ADC1_CHAN0          ADC_CHANNEL_2
-#define EXAMPLE_ADC_ATTEN           ADC_ATTEN_DB_11
+#define EXAMPLE_ADC_ATTEN           ADC_ATTEN_DB_12
 
 static int adc_raw[2][10];
 static int voltage[2][10];

@@ -40,9 +40,7 @@
 #include "esp_bt.h"
 // #include "driver/adc.h"
 #include "esp_sleep.h"
-#include "esp_pm.h"
 #include "driver/rtc_io.h"
-#include "esp_private/phy.h"
 
 
 #define BTBUFF_SIZE 500
@@ -3989,10 +3987,23 @@ exit:
 //    #endif
     
     RestoreEventCache();
-    
-    
+
+
     return 0;
 }
+
+/* Convert 2-digit GPS year + month/day/time (UTC) to Unix epoch seconds. */
+static long osmand_unix_ts(int yy, int mo, int dd, int hh, int mi, int ss)
+{
+    int y = 2000 + yy;
+    int leap = (y % 4 == 0) && ((y % 100 != 0) || (y % 400 == 0));
+    const int mdays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    long d = (long)(y - 1970) * 365L + (y-1)/4 - (y-1)/100 + (y-1)/400 - 477;
+    for (int i = 0; i < mo - 1; i++) d += mdays[i] + (i == 1 ? leap : 0);
+    d += dd - 1;
+    return d * 86400L + hh * 3600L + mi * 60L + ss;
+}
+
 char XHTTP_Request(char *pFilename, unsigned char pingtype)
 {
 
@@ -4022,7 +4033,9 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     if(SystemState == State_ConnectedState) return 0; // Return and idle for proper configuration and prevent EEPROM access
     WakeUp();
     if(DeviceStatus == 0)
-        return 0;		
+        return 0;
+    /* No GPS fix: skip send to avoid storing invalid (0,0) positions and wrong timestamps in Traccar */
+    if(pPacket->GEvent.Lat == 0.0 && pPacket->GEvent.Long == 0.0) return 0;
 //    SOS = gpio_get_level(GPIO_SOS);
 //    if(SOS == 0)
 //    {
@@ -4099,39 +4112,23 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     }
     //IWDG_ReloadCounter();
     ResetBuffer();
-    Print( "AT+HTTPPARA=\"URL\",\"");    
-    //Print( "robopower.in/api/v2/mysql/_table/log");
-    //Print( "alcobrake-lb-406408850.us-east-1.elb.amazonaws.com/api/v2/update");
-    
-    Print((char*)Params.Fields.HTTPURL);
-    Print( "\"\r\n");       
-    LoopTimeout1 = 0;
-    while(1)
+    /* OsmAnd GET URL: base URL (from BT-app config) + query params.
+       Always insert '/' before '?' so the request URI is valid (some HTTP stacks
+       reject queries without a path component). */
     {
-        if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL)
-                break;
-        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
-        {       break; }
-        
+        size_t _ulen = strlen(Params.Fields.HTTPURL);
+        const char *_sep = (_ulen > 0 && Params.Fields.HTTPURL[_ulen-1] == '/') ? "" : "/";
+        snprintf(str, sizeof(str),
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f&timestamp=%ld&vbat=%f&ncsq=%s",
+            Params.Fields.HTTPURL, _sep, IMEI,
+        pPacket->GEvent.Lat, pPacket->GEvent.Long, pPacket->GEvent.Speed,
+        osmand_unix_ts(pPacket->GEvent.Year, pPacket->GEvent.Month, pPacket->GEvent.Date,
+                       pPacket->GEvent.Hours, pPacket->GEvent.Minutes, pPacket->GEvent.Seconds),
+        pPacket->GEvent.Voltage,
+        SignalStrength);
     }
-    
-
-    ResetBuffer();
-    Print("AT+HTTPPARA=\"CONTENT\",\"application/json\"\r\n");
-    LoopTimeout1 = 0;
-    while(1)
-    {
-        if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL)
-                break;
-        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
-        {       break; }
-       
-    }
-        
-    ResetBuffer();        
-    //Print("AT+HTTPPARA=\"USERDATA\",\"X-DreamFactory-Api-Key: ");
-    Print("AT+HTTPPARA=\"USERDATA\",\"");
-    Print((char*)Params.Fields.HTTPKey);
+    Print("AT+HTTPPARA=\"URL\",\"");
+    Print(str);
     Print("\"\r\n");
     LoopTimeout1 = 0;
     while(1)
@@ -4140,49 +4137,13 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
                 break;
         if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
         {       break; }
-        
-    }
 
-    
-//////////////////////////////////////////////////////////
-    #ifdef EXT_ANT_ENABLED 
-        XCheckGPS();
-
-    #endif
-    #ifdef NETWORK_LOCATION_ENABLED
-        GetNetworkLocation();
-    #endif
-///////////////////////////////////////////////////////////    
-
-    memset(str,0,sizeof(str));
-    ConvertToJSON(pPacket,&datalength,str);
-    sprintf((void*)cmdstr,"AT+HTTPDATA=%d,50000\r\n",datalength);    
-    if(SendATCommand(cmdstr,"DOWNLOAD","ERROR",10)!=1) goto exit;
-    
-    
-    DelayProc(250000);
-    //putOn4BData=1;
-    ResetBuffer();    
-    
-    Print(str);
-    printf(str);
-    //putOn4BData=0;
-    LoopTimeout1 = 0;
-    while(1)
-    {
-        //Print("\n\n\n\n\n\n\n\n\n\n");
-        if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL)
-                break;
-        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
-        {       
-            goto exit; 
-        }
-        
     }
     
+
     ////IWDG_ReloadCounter();
     ResetBuffer();
-    Print("AT+HTTPACTION=1\r\n");
+    Print("AT+HTTPACTION=0\r\n");
     LoopTimeout1 = 0;
     while(1)
     {
@@ -7440,8 +7401,8 @@ void app_main(void)
     
     //esp_nimble_hci_and_controller_init();      // 2 - Initialize ESP controller
     nimble_port_init();                        // 3 - Initialize the host stack
-    ble_svc_gap_device_name_set(TAG); // 4 - Initialize NimBLE configuration - server name
     ble_svc_gap_init();                        // 4 - Initialize NimBLE configuration - gap service
+    ble_svc_gap_device_name_set(TAG); // 4 - Set device name AFTER gap init (gap init resets to default)
     ble_svc_gatt_init();                       // 4 - Initialize NimBLE configuration - gatt service
     ble_gatts_count_cfg(gatt_svcs);            // 4 - Initialize NimBLE configuration - config gatt services
     ble_gatts_add_svcs(gatt_svcs);             // 4 - Initialize NimBLE configuration - queues gatt services.
