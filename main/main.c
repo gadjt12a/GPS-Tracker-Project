@@ -521,6 +521,8 @@ unsigned long  IntervalTimer;
 unsigned short MotionTimer=0;
 uint32_t ParkLongTimer = 0;      // seconds since last motion; 48hr threshold → deep sleep
 static int heartbeat_wake = 0;   // 1 when woken by 8hr timer; cleared after first ping
+static float last_good_lat = 0.0f; // last GPS fix with valid position
+static float last_good_lon = 0.0f;
 unsigned short HeartBeatTimer = 0;
 unsigned short NoSignalTimer=0;
 unsigned short ButtonPressTimer=0;
@@ -4055,8 +4057,19 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     WakeUp();
     if(DeviceStatus == 0)
         return 0;
-    /* No GPS fix: skip send to avoid storing invalid (0,0) positions and wrong timestamps in Traccar */
-    if(pPacket->GEvent.Lat == 0.0 && pPacket->GEvent.Long == 0.0) return 0;
+    /* Use current fix if available; fall back to last known position (e.g. heartbeat under a carport).
+       Block only if we have never had a fix at all. */
+    float send_lat = pPacket->GEvent.Lat;
+    float send_lon = pPacket->GEvent.Long;
+    if (send_lat == 0.0f && send_lon == 0.0f) {
+        if (last_good_lat == 0.0f)
+            return 0; // No fix and no cached position yet — nothing useful to send
+        send_lat = last_good_lat;
+        send_lon = last_good_lon;
+    } else {
+        last_good_lat = send_lat;
+        last_good_lon = send_lon;
+    }
 //    SOS = gpio_get_level(GPIO_SOS);
 //    if(SOS == 0)
 //    {
@@ -4142,7 +4155,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         snprintf(str, sizeof(str),
             "%s%s?id=%s&lat=%f&lon=%f&speed=%f&timestamp=%ld&vbat=%f&ncsq=%s",
             Params.Fields.HTTPURL, _sep, IMEI,
-        pPacket->GEvent.Lat, pPacket->GEvent.Long, pPacket->GEvent.Speed,
+        send_lat, send_lon, pPacket->GEvent.Speed,
         osmand_unix_ts(pPacket->GEvent.Year, pPacket->GEvent.Month, pPacket->GEvent.Date,
                        pPacket->GEvent.Hours, pPacket->GEvent.Minutes, pPacket->GEvent.Seconds),
         pPacket->GEvent.Voltage,
