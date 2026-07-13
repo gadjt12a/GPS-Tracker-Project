@@ -94,7 +94,7 @@ static void uart_event_task(void *pvParameters)
                         if(Data != 0x00)
                         {  Buff2[Buff2Index]=Data;    }//USART_ReceiveData(USART2);
                         else
-                        { return;}
+                        { continue; }
                             //if( (Buff[BuffIndex-1] == 0x0D)&&(Buff[BuffIndex] == 0x0A) )
                             //if( (Buff[BuffIndex-2] == 'R')&&(Buff[BuffIndex-1] == 'M')&&(Buff[BuffIndex] == 'C') )
                     
