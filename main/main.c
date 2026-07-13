@@ -521,6 +521,7 @@ unsigned short tSeconds;
 unsigned short SystemTimer;
 unsigned short InactivityTimer;
 unsigned long  IntervalTimer;
+volatile int   force_ping_now = 0; // set by PING_NOW remote command; cleared after next ping
 unsigned short MotionTimer=0;
 uint32_t ParkLongTimer = 0;      // seconds since last motion; 48hr threshold → deep sleep
 static int heartbeat_wake = 0;   // 1 when woken by 8hr timer; cleared after first ping
@@ -2864,12 +2865,13 @@ void StartTimerTask(void *argument)
             uint32_t effectiveInterval = (ParkLongTimer < TIME_TO_SLEEP || heartbeat_wake)
                 ? Params.Fields.PingInterval
                 : TIME_TO_SLEEP;
-            if(IntervalTimer > effectiveInterval && ChargingStatus == DISCONNECTED)
+            if((IntervalTimer > effectiveInterval || force_ping_now) && ChargingStatus == DISCONNECTED)
             {
                 #ifdef MOTION_CONTROLLED_PINGS
                     if(MotionTimer < TIME_TO_SLEEP
                        || ParkLongTimer < PARK_LONG_SECONDS
-                       || heartbeat_wake)
+                       || heartbeat_wake
+                       || force_ping_now)
                     {
                         PostGPing();
                         heartbeat_wake = 0;
@@ -2880,6 +2882,7 @@ void StartTimerTask(void *argument)
                 #endif
 
                 IntervalTimer = 0;
+                force_ping_now = 0;
             }
         }
         #ifdef LPUART_TIMER_RESET_ENABLED
@@ -4268,8 +4271,18 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
             }
             if(MapForward(Buff2,BUFF2_SIZE,(char*)"V_RESET",7) != NULL)
             {
-                //ResetBuffer2();     
-                //Print2((void*)CViolation);
+                /* Remote reboot via Traccar custom command "Moved V_RESET".
+                   HTTPTERM first so the modem session is clean before reset. */
+                Print("AT+HTTPTERM\r\n");
+                osDelay(500);
+                esp_restart();
+            }
+            if(MapForward(Buff2,BUFF2_SIZE,(char*)"PING_NOW",8) != NULL)
+            {
+                /* Remote immediate ping via Traccar custom command "Moved PING_NOW".
+                   Sets flag checked by main loop; next tick sends a position report
+                   without waiting for the normal interval. */
+                force_ping_now = 1;
             }
             if(MapForward(Buff2,BUFF2_SIZE,(char*)"GET_VER",7) != NULL)
             {
