@@ -2385,6 +2385,8 @@ unsigned char InitGSM(void)
             #if defined(A7672)
                 SendATCommand("AT+CGNSSPWR=1\r\n","READY","ERROR",60);
                 SendATCommand("AT+CGNSSPWR?\r\n","OK","ERROR",60);
+                SendATCommand("AT+CGNSSMODE=15\r\n","OK","ERROR",5);   // GPS+GLONASS+BeiDou+Galileo
+                SendATCommand("AT+CGPSXE=1\r\n","OK","ERROR",10);      // XTRA extended ephemeris via LTE
             #endif
             #if defined(SIM7672)
                 

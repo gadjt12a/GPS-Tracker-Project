@@ -47,6 +47,31 @@ Three-tier power/reporting state machine driven by the onboard LIS3DH accelerome
 - Motion during deep sleep (LIS3DH INT1 asserted low) wakes the device and resumes normal reporting immediately
 - The 48 hr threshold is intentional: a daily driver parked Friday–Monday stays in parked-short mode over the weekend rather than entering deep sleep mid-weekend
 
+### 5. OTA firmware updates
+The device checks for a new firmware version on each boot. If the OTA server reports a newer version, the binary is downloaded in chunks over LTE and written to the inactive OTA partition. The device reboots into the new firmware; if it crashes before a successful Traccar report the bootloader auto-rolls back to the previous version.
+
+- Partition layout: dual OTA (`ota_0` @ 0x20000, `ota_1` @ 0x110000, each 960 KB) with `otadata` at 0xF000
+- Version manifest: `GET http://ota.pawson.co.nz/version.json` → `{"ver":"x.y.z"}`
+- Binary: `GET http://ota.pawson.co.nz/firmware.bin` (streamed in 4096-byte Range chunks)
+- Current firmware version reported as `fwver` attribute in every Traccar position
+
+### 6. Remote commands via Traccar
+Send commands to a device through Traccar's **Custom Command** (`Moved <CMD>`):
+
+| Command | Effect |
+|---|---|
+| `Moved V_RESET` | Reboot the device (triggers OTA check on next boot) |
+| `Moved PING_NOW` | Force an immediate position report |
+
+### 7. Speed derivation
+The SIM7672G/A7672 modem reports speed = 0 even when moving. Speed is now derived from consecutive lat/lon positions divided by the reporting interval, so Traccar trip detection works correctly.
+
+### 8. GPS sanity filter + last-known-position cache
+Cold-start artifacts near (0°, 0°–3°) are rejected before being sent. When the GNSS module has no current fix, the last known valid position is reported instead, keeping the device visible on the map. Reports are blocked only if no fix has ever been obtained in the current session.
+
+### 9. Multi-constellation GNSS + AGPS (v2.3.8)
+`AT+CGNSSMODE=15` enables GPS + GLONASS + BeiDou + Galileo simultaneously, giving 3–4× more visible satellites. `AT+CGPSXE=1` enables XTRA extended ephemeris download over LTE, reducing cold-start TTFF from 12+ minutes to seconds. Both commands are sent at GPS power-on during modem init.
+
 ---
 
 ## Works With
@@ -69,13 +94,18 @@ In Traccar, add the device using its IMEI as the identifier. The OsmAnd protocol
 
 ## Flashing
 
+Initial flash (sets up OTA partition table — required once per unit before OTA can be used):
+
 ```
 esptool --chip esp32c3 -p <PORT> -b 460800 --before default-reset write-flash \
     --flash-mode dio --flash-freq 80m --flash-size 2MB \
-    0x0     build/bootloader/bootloader.bin \
-    0x8000  build/partition_table/partition-table.bin \
-    0x10000 build/VALTRACK-V4-ESP32C3.bin
+    0x0      build/bootloader/bootloader.bin \
+    0x8000   build/partition_table/partition-table.bin \
+    0xf000   build/ota_data_initial.bin \
+    0x20000  build/VALTRACK-V4-ESP32C3.bin
 ```
+
+After the initial flash, subsequent updates are delivered via OTA — no USB access needed.
 
 ---
 
