@@ -182,7 +182,7 @@ extern const char *TAG;
 #define HEART_BEAT_INTERVAL (8*3600) // 8hr deep-sleep heartbeat wakeup
 
 // OTA firmware update
-#define FW_VERSION          "2.3.4"
+#define FW_VERSION          "2.3.5"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096

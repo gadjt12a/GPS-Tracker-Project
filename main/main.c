@@ -6417,6 +6417,9 @@ ESP_LOGI(TAG,"Entered main task");
     //
     SyncRTC();
     CheckAndApplyOTA();
+    /* If CheckAndApplyOTA() returned, this partition is good — mark valid now
+       so the bootloader doesn't roll back due to a missed GPS fix. */
+    esp_ota_mark_app_valid_cancel_rollback();
     InitRTCAlarm();
     ADCRunning = 0;
     Count=0;
