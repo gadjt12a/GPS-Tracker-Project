@@ -525,8 +525,8 @@ volatile int   force_ping_now = 0; // set by PING_NOW remote command; cleared af
 unsigned short MotionTimer=0;
 uint32_t ParkLongTimer = 0;      // seconds since last motion; 48hr threshold → deep sleep
 static int heartbeat_wake = 0;   // 1 when woken by 8hr timer; cleared after first ping
-static float last_good_lat = 0.0f; // last GPS fix with valid position
-static float last_good_lon = 0.0f;
+float last_good_lat = 0.0f; // last GPS fix — persisted to NVS, survives reboots
+float last_good_lon = 0.0f;
 unsigned short HeartBeatTimer = 0;
 unsigned short NoSignalTimer=0;
 unsigned short ButtonPressTimer=0;
@@ -1068,6 +1068,8 @@ int GetLength(char *p)
 }
 void WakeUp(void);
 void CheckAndApplyOTA(void);
+void nvs_save_position(void);
+void nvs_load_position(void);
 
 
 
@@ -4066,15 +4068,20 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         return 0;
     float send_lat = pPacket->GEvent.Lat;
     float send_lon = pPacket->GEvent.Long;
+    /* Allow pinging for 5 minutes after boot even with no GPS fix so Traccar
+       can receive the device and send remote commands (V_RESET, OTA rollback).
+       Positions with lat=0/lon=0 are filtered server-side by filter.zero=true
+       so they don't pollute the map, but the HTTP response still arrives. */
+    bool in_boot_window = (esp_timer_get_time() < 300ULL * 1000000ULL);
     if (send_lat == 0.0f && send_lon == 0.0f) {
-        if (last_good_lat == 0.0f)
+        if (last_good_lat == 0.0f && !in_boot_window)
             return 0;
         send_lat = last_good_lat;
         send_lon = last_good_lon;
     } else if (send_lat > -1.0f && send_lat < 1.0f && send_lon > -1.0f && send_lon < 3.0f) {
         /* Fix A: SIM7672G cold-start artifact — GNSS reports a "valid" fix near
            the origin while still acquiring. Treat as no-fix, use cache. */
-        if (last_good_lat == 0.0f)
+        if (last_good_lat == 0.0f && !in_boot_window)
             return 0;
         send_lat = last_good_lat;
         send_lon = last_good_lon;
@@ -4091,6 +4098,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         }
         last_good_lat = send_lat;
         last_good_lon = send_lon;
+        nvs_save_position();
     }
 //    SOS = gpio_get_level(GPIO_SOS);
 //    if(SOS == 0)
@@ -4272,7 +4280,8 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
             if(MapForward(Buff2,BUFF2_SIZE,(char*)"V_RESET",7) != NULL)
             {
                 /* Remote reboot via Traccar custom command "Moved V_RESET".
-                   HTTPTERM first so the modem session is clean before reset. */
+                   Save position to NVS so next boot can ping immediately. */
+                nvs_save_position();
                 Print("AT+HTTPTERM\r\n");
                 osDelay(500);
                 esp_restart();
@@ -6420,6 +6429,9 @@ ESP_LOGI(TAG,"Entered main task");
     /* If CheckAndApplyOTA() returned, this partition is good — mark valid now
        so the bootloader doesn't roll back due to a missed GPS fix. */
     esp_ota_mark_app_valid_cancel_rollback();
+    /* Restore last known position from NVS so we can ping Traccar immediately
+       after reboot without waiting for a GPS fix. */
+    nvs_load_position();
     InitRTCAlarm();
     ADCRunning = 0;
     Count=0;
@@ -7517,6 +7529,32 @@ static bool ota_read_exact(uint8_t *buf, int n, uint32_t timeout_ms)
 }
 
 // Bring up PDP context for OTA (mirrors the setup in XHTTP_Request).
+void nvs_save_position(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("valtrack", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, "last_lat", (int32_t)(last_good_lat * 1e6f));
+        nvs_set_i32(h, "last_lon", (int32_t)(last_good_lon * 1e6f));
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+void nvs_load_position(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("valtrack", NVS_READONLY, &h) == ESP_OK) {
+        int32_t lat_raw = 0, lon_raw = 0;
+        nvs_get_i32(h, "last_lat", &lat_raw);
+        nvs_get_i32(h, "last_lon", &lon_raw);
+        nvs_close(h);
+        if (lat_raw != 0 || lon_raw != 0) {
+            last_good_lat = lat_raw / 1e6f;
+            last_good_lon = lon_raw / 1e6f;
+        }
+    }
+}
+
 static bool ota_network_up(void)
 {
     sprintf(str, "AT+CGDCONT=1,\"IP\",\"%s\"\r\n", Params.Fields.APNName);
