@@ -4086,7 +4086,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
             float dlon = (send_lon - last_good_lon) * 86.0f;
             float dist_km = sqrtf(dlat * dlat + dlon * dlon);
             float speed_kmh = dist_km * 3600.0f / (float)Params.Fields.PingInterval;
-            if (speed_kmh > 1.0f && speed_kmh < 300.0f)
+            if (speed_kmh > 4.0f && speed_kmh < 300.0f)
                 pPacket->GEvent.Speed = speed_kmh;
         }
         last_good_lat = send_lat;
@@ -7525,6 +7525,14 @@ static bool ota_network_up(void)
 // Open HTTP session for the given URL (no Range).
 static void ota_http_open(const char *url)
 {
+    /* Defensive teardown in case a previous session was left open by an abort. */
+    ResetBuffer();
+    Print("AT+HTTPTERM\r\n");
+    LoopTimeout1 = 0;
+    while (1) {
+        if (MapForward(Buff2, BUFF2_SIZE, (char*)"OK",    2) != NULL) break;
+        if (MapForward(Buff2, BUFF2_SIZE, (char*)"ERROR", 5) != NULL || LoopTimeout1 > 5) break;
+    }
     ResetBuffer();
     Print("AT+HTTPINIT\r\n");
     LoopTimeout1 = 0;
@@ -7681,7 +7689,7 @@ void CheckAndApplyOTA(void)
                 char *p = MapForward(Buff2, BUFF2_SIZE, (char*)"+HTTPACTION:", 12);
                 if (p) {
                     int c = 0;
-                    while (*p && c < 3) { if (*p++ == ',') c++; }
+                    while (*p && c < 2) { if (*p++ == ',') c++; }
                     got_size = atoi(p);
                 }
                 break;
