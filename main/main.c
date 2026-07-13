@@ -42,6 +42,7 @@
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 #include "esp_ota_ops.h"
+#include <math.h>
 extern TaskHandle_t uart_event_task_handle;
 
 
@@ -4060,16 +4061,31 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     WakeUp();
     if(DeviceStatus == 0)
         return 0;
-    /* Use current fix if available; fall back to last known position (e.g. heartbeat under a carport).
-       Block only if we have never had a fix at all. */
     float send_lat = pPacket->GEvent.Lat;
     float send_lon = pPacket->GEvent.Long;
     if (send_lat == 0.0f && send_lon == 0.0f) {
         if (last_good_lat == 0.0f)
-            return 0; // No fix and no cached position yet — nothing useful to send
+            return 0;
+        send_lat = last_good_lat;
+        send_lon = last_good_lon;
+    } else if (send_lat > -1.0f && send_lat < 1.0f && send_lon > -1.0f && send_lon < 3.0f) {
+        /* Fix A: SIM7672G cold-start artifact — GNSS reports a "valid" fix near
+           the origin while still acquiring. Treat as no-fix, use cache. */
+        if (last_good_lat == 0.0f)
+            return 0;
         send_lat = last_good_lat;
         send_lon = last_good_lon;
     } else {
+        /* SIM7672G AT+CGPSINFO often returns speed=0 even when moving.
+           Derive speed from consecutive position change so Traccar can detect trips. */
+        if (pPacket->GEvent.Speed == 0.0f && last_good_lat != 0.0f) {
+            float dlat = (send_lat - last_good_lat) * 111.0f;
+            float dlon = (send_lon - last_good_lon) * 86.0f;
+            float dist_km = sqrtf(dlat * dlat + dlon * dlon);
+            float speed_kmh = dist_km * 3600.0f / (float)Params.Fields.PingInterval;
+            if (speed_kmh > 1.0f && speed_kmh < 300.0f)
+                pPacket->GEvent.Speed = speed_kmh;
+        }
         last_good_lat = send_lat;
         last_good_lon = send_lon;
     }
@@ -4120,6 +4136,17 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     {
         goto exit;
     }
+    /* Fix B: clear any session left open by a previous interrupted call.
+       SIM7672G accumulates open sessions if HTTPTERM is missed; each
+       subsequent HTTPACTION fires all of them, causing a request storm. */
+    ResetBuffer();
+    Print("AT+HTTPTERM\r\n");
+    LoopTimeout1 = 0;
+    while(1)
+    {
+        if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL) break;
+        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>5)) break;
+    }
     ResetBuffer();
     Print("AT+HTTPINIT\r\n");
     LoopTimeout1 = 0;
@@ -4156,7 +4183,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         size_t _ulen = strlen(Params.Fields.HTTPURL);
         const char *_sep = (_ulen > 0 && Params.Fields.HTTPURL[_ulen-1] == '/') ? "" : "/";
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f&timestamp=%ld&vbat=%f&ncsq=%s",
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f&timestamp=%ld&vbat=%f&ncsq=%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed,
         osmand_unix_ts(pPacket->GEvent.Year, pPacket->GEvent.Month, pPacket->GEvent.Date,
@@ -7535,7 +7562,7 @@ static int ota_http_action_size(void)
     char *p = MapForward(Buff2, BUFF2_SIZE, (char*)"+HTTPACTION:", 12);
     if (!p) return -1;
     int commas = 0;
-    while (*p && commas < 3) { if (*p++ == ',') commas++; }
+    while (*p && commas < 2) { if (*p++ == ',') commas++; }
     return (*p) ? atoi(p) : -1;
 }
 

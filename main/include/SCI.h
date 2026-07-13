@@ -1,4 +1,4 @@
-/***************************************************************************
+﻿/***************************************************************************
 * File name :   SCI.h                                                      *
 *                                                                          *
 * Author    :   Ravi Y. Pujar                                              *
@@ -178,11 +178,11 @@ extern const char *TAG;
 
 
 #define TIME_TO_SLEEP 300
-#define PARK_LONG_SECONDS 172800UL   // 48 hours — threshold to enter deep sleep
+#define PARK_LONG_SECONDS 172800UL   // 48 hours â€” threshold to enter deep sleep
 #define HEART_BEAT_INTERVAL (8*3600) // 8hr deep-sleep heartbeat wakeup
 
 // OTA firmware update
-#define FW_VERSION          "2.1.0"
+#define FW_VERSION          "2.3.0"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096
