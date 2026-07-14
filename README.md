@@ -70,7 +70,7 @@ The SIM7672G/A7672 modem reports speed = 0 even when moving. Speed is now derive
 Cold-start artifacts near (0°, 0°–3°) are rejected before being sent. When the GNSS module has no current fix, the last known valid position is reported instead, keeping the device visible on the map. Reports are blocked only if no fix has ever been obtained in the current session.
 
 ### 9. Multi-constellation GNSS + AGPS (v2.3.8)
-`AT+CGNSSMODE=15` enables GPS + GLONASS + BeiDou + Galileo simultaneously, giving 3–4× more visible satellites. `AT+CGPSXE=1` enables XTRA extended ephemeris download over LTE, reducing cold-start TTFF from 12+ minutes to seconds. Both commands are sent at GPS power-on during modem init.
+`AT+CGNSSMODE=15` and `AT+CGPSXE=1` are sent at GPS power-on to request GPS + GLONASS + BeiDou + Galileo and XTRA extended ephemeris. **Note:** both commands return `ERROR` on the SIM7672G modem firmware shipped with this hardware — they are prepared but have no effect until Valetron ships a modem firmware update that supports them.
 
 ---
 
@@ -106,6 +106,23 @@ esptool --chip esp32c3 -p <PORT> -b 460800 --before default-reset write-flash \
 ```
 
 After the initial flash, subsequent updates are delivered via OTA — no USB access needed.
+
+---
+
+## Version History
+
+| Version | Changes |
+|---|---|
+| **2.3.13** | OTA rollback-timing fix: partition marked valid before `InitGSM()` so modem failures don't trigger rollback. OTA download redesigned: full binary buffered once in modem HTTP RAM via single `AT+HTTPACTION=0`, read sequentially with `AT+HTTPREAD=<offset>,<len>` — eliminates 165 per-chunk HTTP connections and the `+HTTPREAD: 0` residual bug that was aborting downloads. |
+| **2.3.8** | Multi-constellation GNSS (`AT+CGNSSMODE=15`) and XTRA AGPS (`AT+CGPSXE=1`) commands added at GPS init (commands return ERROR on current modem firmware — no-op until modem update). |
+| **2.3.7** | Fixed `uart_event_task` crash on null byte in modem URC stream. |
+| **2.3.6** | NVS position persistence across reboots. 5-minute boot window allows pinging Traccar before GPS fix. |
+| **2.3.5** | OTA partition marked valid immediately at boot rather than after first GPS fix, preventing spurious rollbacks on slow GPS acquisition. |
+| **2.3.4** | OTA chunk download bug fix. HTTP session storm fix (defensive `AT+HTTPTERM` before `AT+HTTPINIT`). |
+| **2.3.2** | Remote command support: `Moved V_RESET` (reboot) and `Moved PING_NOW` (force report) via Traccar custom commands. |
+| **2.3.0** | Speed derivation from consecutive positions. GPS cold-start artifact filter. Zero-speed trip detection fix. |
+| **2.2.0** | OTA version check comma-count fix. Flash address corrected to `0x20000` (ota_0). |
+| **2.1.0** | Initial OTA implementation (dual-partition layout, modem HTTP download). |
 
 ---
 
