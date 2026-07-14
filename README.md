@@ -48,11 +48,11 @@ Three-tier power/reporting state machine driven by the onboard LIS3DH accelerome
 - The 48 hr threshold is intentional: a daily driver parked Friday–Monday stays in parked-short mode over the weekend rather than entering deep sleep mid-weekend
 
 ### 5. OTA firmware updates
-The device checks for a new firmware version on each boot. If the OTA server reports a newer version, the binary is downloaded in chunks over LTE and written to the inactive OTA partition. The device reboots into the new firmware; if it crashes before a successful Traccar report the bootloader auto-rolls back to the previous version.
+The device checks for a new firmware version on each boot. If the OTA server reports a newer version, the binary is downloaded over LTE and written to the inactive OTA partition. The device reboots into the new firmware; if it crashes before marking itself valid the bootloader auto-rolls back to the previous version. The partition is marked valid as soon as basic init completes — a transient modem failure does not trigger a rollback.
 
 - Partition layout: dual OTA (`ota_0` @ 0x20000, `ota_1` @ 0x110000, each 960 KB) with `otadata` at 0xF000
 - Version manifest: `GET http://ota.pawson.co.nz/version.json` → `{"ver":"x.y.z"}`
-- Binary: `GET http://ota.pawson.co.nz/firmware.bin` (streamed in 4096-byte Range chunks)
+- Binary: downloaded once to the modem's HTTP buffer via a single `AT+HTTPACTION=0`, then read sequentially in 4096-byte blocks using `AT+HTTPREAD=<offset>,<len>` — no per-chunk HTTP reconnections
 - Current firmware version reported as `fwver` attribute in every Traccar position
 
 ### 6. Remote commands via Traccar

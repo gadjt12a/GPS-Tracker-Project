@@ -6396,10 +6396,15 @@ ESP_LOGI(TAG,"Entered main task");
 //        }
 //    }
     InitAccelerometer();
-   
+
+    /* Mark this partition valid as soon as basic init completes.
+       A transient modem failure must not trigger a rollback — that
+       would cause a 2.3.N → 2.3.N-1 loop every time InitGSM() is slow. */
+    esp_ota_mark_app_valid_cancel_rollback();
+
 //goto DIE;
     osDelay(5000);
-   
+
     if(InitGSM() == 3)
     {
         MotionTimer = TIME_TO_SLEEP+1; //  Make sure no events are in queue to enter sleep
@@ -6421,16 +6426,13 @@ ESP_LOGI(TAG,"Entered main task");
         ESP_LOGI(TAG,"Forcing Sleep after Init GSM due to no network\n");
         ForceToSleep();
     }
-    
-    
+
+
     //
     //GetNetworkData();
     //
     SyncRTC();
     CheckAndApplyOTA();
-    /* If CheckAndApplyOTA() returned, this partition is good — mark valid now
-       so the bootloader doesn't roll back due to a missed GPS fix. */
-    esp_ota_mark_app_valid_cancel_rollback();
     /* Restore last known position from NVS so we can ping Traccar immediately
        after reboot without waiting for a GPS fix. */
     nvs_load_position();
@@ -7679,13 +7681,14 @@ void CheckAndApplyOTA(void)
     ESP_LOGI(TAG, "OTA: update available, downloading...");
 
     // ---- Step 2: determine firmware size ----
+    // AT+HTTPACTION=0 downloads the full binary into the modem's HTTP buffer.
+    // Keep the session open — Step 4 reads directly from this buffer.
     ota_http_open(OTA_FIRMWARE_URL);
     int firmware_size = ota_http_action_size();
-    ota_http_close();
 
     if (firmware_size <= 0 || firmware_size > (int)OTA_MAX_FIRMWARE) {
         ESP_LOGE(TAG, "OTA: bad firmware size %d", firmware_size);
-        return;
+        goto ota_abort;
     }
 
     // ---- Step 3: begin OTA write ----
@@ -7702,80 +7705,57 @@ void CheckAndApplyOTA(void)
     chunk_buf = (uint8_t*)heap_caps_malloc(OTA_CHUNK_SIZE, MALLOC_CAP_DEFAULT);
     if (!chunk_buf) { ESP_LOGE(TAG, "OTA: malloc failed"); goto ota_abort; }
 
-    // ---- Step 4: download in OTA_CHUNK_SIZE Range chunks ----
+    // ---- Step 4: single-session sequential HTTPREAD ----
+    // The modem already has the full binary buffered from the AT+HTTPACTION=0 in Step 2.
+    // Suspend uart_event_task once for the entire download.
+    vTaskSuspend(uart_event_task_handle);
+    uart_flush_input(UART_PORT_NUM);
+
     int offset = 0;
+    bool download_ok = true;
     while (offset < firmware_size) {
         int end_byte   = offset + OTA_CHUNK_SIZE - 1;
         if (end_byte >= firmware_size) end_byte = firmware_size - 1;
         int this_chunk = end_byte - offset + 1;
 
-        // Open HTTP with Range header for this chunk
-        ota_http_open(OTA_FIRMWARE_URL);
-        ResetBuffer();
-        snprintf(str, sizeof(str),
-                 "AT+HTTPPARA=\"USERDATA\",\"Range: bytes=%d-%d\"\r\n",
-                 offset, end_byte);
-        Print(str);
-        LoopTimeout1 = 0;
-        while (1) {
-            if (MapForward(Buff2, BUFF2_SIZE, (char*)"OK",    2) != NULL) break;
-            if (MapForward(Buff2, BUFF2_SIZE, (char*)"ERROR", 5) != NULL || LoopTimeout1 > 30) goto ota_abort;
-        }
-        // Trigger the range request; modem fetches this_chunk bytes
-        ResetBuffer();
-        Print("AT+HTTPACTION=0\r\n");
-        LoopTimeout1 = 0;
-        int got_size = -1;
-        while (1) {
-            if (MapForward(Buff2, BUFF2_SIZE, (char*)"ACTION:", 7) != NULL) {
-                osDelay(300);
-                char *p = MapForward(Buff2, BUFF2_SIZE, (char*)"+HTTPACTION:", 12);
-                if (p) {
-                    int c = 0;
-                    while (*p && c < 2) { if (*p++ == ',') c++; }
-                    got_size = atoi(p);
-                }
-                break;
-            }
-            if (MapForward(Buff2, BUFF2_SIZE, (char*)"ERROR", 5) != NULL || LoopTimeout1 > 60)
-                goto ota_abort;
-        }
-        if (got_size != this_chunk) {
-            ESP_LOGE(TAG, "OTA: chunk size mismatch exp=%d got=%d", this_chunk, got_size);
-            goto ota_abort;
-        }
-
-        // Suspend uart_event_task and take UART exclusively for binary read
-        vTaskSuspend(uart_event_task_handle);
-        uart_flush_input(UART_PORT_NUM);
-
-        // Send AT+HTTPREAD and read binary payload directly
-        snprintf(str, sizeof(str), "AT+HTTPREAD=0,%d\r\n", this_chunk);
+        // AT+HTTPREAD=<offset>,<len> reads from the modem's buffered response.
+        // The modem delivers data in ≤1024-byte sub-blocks, each prefixed by "+HTTPREAD: N\r\n".
+        snprintf(str, sizeof(str), "AT+HTTPREAD=%d,%d\r\n", offset, this_chunk);
         uart_write_bytes(UART_PORT_NUM, str, strlen(str));
 
-        int header_n = ota_read_httpread_header(10000);
-        bool read_ok = (header_n == this_chunk) &&
-                       ota_read_exact(chunk_buf, this_chunk, 30000);
-
-        vTaskResume(uart_event_task_handle);
-
-        if (!read_ok) {
-            ESP_LOGE(TAG, "OTA: binary read failed at offset %d", offset);
-            ota_http_close();
-            goto ota_abort;
+        int total_received = 0;
+        while (total_received < this_chunk) {
+            int header_n = ota_read_httpread_header(30000);
+            if (header_n <= 0) { download_ok = false; break; }
+            if (!ota_read_exact(chunk_buf + total_received, header_n, 60000)) { download_ok = false; break; }
+            total_received += header_n;
         }
-
-        ota_http_close();
+        if (total_received != this_chunk) download_ok = false;
+        if (!download_ok) break;
 
         err = esp_ota_write(ota_handle, chunk_buf, this_chunk);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "OTA: write failed %s", esp_err_to_name(err));
-            goto ota_abort;
-        }
-
+        if (err != ESP_OK) { download_ok = false; break; }
         offset += this_chunk;
         ESP_LOGI(TAG, "OTA: %d/%d bytes", offset, firmware_size);
+
+        // The modem appends "+HTTPREAD: 0\r\n" + "OK\r\n" after each AT+HTTPREAD response.
+        // Drain these before sending the next AT+HTTPREAD or they poison the next header parse.
+        vTaskDelay(pdMS_TO_TICKS(200));
+        uart_flush_input(UART_PORT_NUM);
     }
+
+    // Close HTTP session in direct UART mode before restoring uart_event_task.
+    uart_write_bytes(UART_PORT_NUM, "AT+HTTPTERM\r\n", 13);
+    { uint8_t _b; uint32_t _dl = xTaskGetTickCount() + pdMS_TO_TICKS(3000);
+      while (xTaskGetTickCount() < _dl) uart_read_bytes(UART_PORT_NUM, &_b, 1, pdMS_TO_TICKS(100)); }
+
+    vTaskResume(uart_event_task_handle);
+
+    if (!download_ok) {
+        ESP_LOGE(TAG, "OTA: download failed at offset %d/%d", offset, firmware_size);
+        goto ota_abort;
+    }
+    ESP_LOGI(TAG, "OTA: all %d bytes downloaded", firmware_size);
 
     // ---- Step 5: commit and reboot ----
     if (esp_ota_end(ota_handle) != ESP_OK ||
