@@ -700,8 +700,19 @@ void HandleGPSINFData(unsigned char Byte)
                         // sscanf( (void*)Course, "%f", &fCourse);
 
                         sscanf( (void*)GPSDate, "%2d%2d%2d", (int*)&GPSDay,(int*)&GPSMonth,(int*)&GPSYear);
-                                               
+
                         sscanf( (void*)GPSTime, "%2d%2d%2d", (int*)&GPSHours,(int*)&GPSMinutes,(int*)&GPSSeconds);
+
+                        /* Clear field buffers after parsing. The A7672 leaves
+                           speed/course EMPTY when stationary; without this the
+                           stale text from the last moving fix is re-parsed
+                           forever (speed frozen at last driving value). */
+                        memset(Lat, 0, sizeof(Lat));
+                        memset(Long, 0, sizeof(Long));
+                        memset(Altitude, 0, sizeof(Altitude));
+                        memset(Speed, 0, 10);
+                        memset(GPSDate, 0, sizeof(GPSDate));
+                        memset(GPSTime, 0, sizeof(GPSTime));
                         // printf("%s,%d,%d,%d\n",GPSDate,GPSDay,GPSMonth,GPSYear);
                         // printf("%s,%d,%d,%d\n",GPSTime,GPSHours,GPSMinutes,GPSSeconds);
 

@@ -4292,7 +4292,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         snprintf(str, sizeof(str),
             "%s%s?id=%s&lat=%f&lon=%f&speed=%f&timestamp=%ld&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
-            smp->lat, smp->lon, smp->speed,
+            smp->lat, smp->lon, smp->speed / 1.852f, // OsmAnd speed param is knots
             osmand_unix_ts(smp->yy, smp->mo, smp->dd, smp->hh, smp->mi, smp->ss));
         ResetBuffer();
         Print("AT+HTTPPARA=\"URL\",\"");
@@ -4337,7 +4337,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         snprintf(str, sizeof(str),
             "%s%s?id=%s&lat=%f&lon=%f&speed=%f&timestamp=%ld&vbat=%f&ncsq=%s&ignition=%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
-        send_lat, send_lon, pPacket->GEvent.Speed,
+        send_lat, send_lon, pPacket->GEvent.Speed / 1.852f, // OsmAnd speed param is knots
         osmand_unix_ts(pPacket->GEvent.Year, pPacket->GEvent.Month, pPacket->GEvent.Date,
                        pPacket->GEvent.Hours, pPacket->GEvent.Minutes, pPacket->GEvent.Seconds),
         pPacket->GEvent.Voltage,
@@ -7994,7 +7994,11 @@ void app_main(void)
     SleepWakeupReason();
     // Timer wakeup = 8hr heartbeat from parked-long deep sleep.
     // Set ParkLongTimer to threshold so DeepSleep() fires after one ping.
-    if (esp_sleep_get_wakeup_causes() & (1ULL << ESP_SLEEP_WAKEUP_TIMER)) {
+    // MUST check reset reason: the wakeup-cause register survives software
+    // resets (esp_restart after OTA/V_RESET) and a stale TIMER bit here sent
+    // the device into phantom deep sleep minutes after an OTA reboot.
+    if (esp_reset_reason() == ESP_RST_DEEPSLEEP &&
+        (esp_sleep_get_wakeup_causes() & (1ULL << ESP_SLEEP_WAKEUP_TIMER))) {
         ParkLongTimer = PARK_LONG_SECONDS;
         heartbeat_wake = 1;
     }
