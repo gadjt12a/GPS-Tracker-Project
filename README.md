@@ -76,6 +76,14 @@ Cold-start artifacts near (0°, 0°–3°) are rejected before being sent. When 
 ### 10. Modem always-on (no CSCLK sleep) (v2.3.14)
 `AT+CSCLK=2` (modem slow-clock sleep) was removed from all code paths. The A7672G modem now stays at `AT+CSCLK=0` (always awake). Previously, the modem was put to sleep after each HTTP ping, but the GPS polling loop (`AT+CGPSINFO` every second) was waking it again immediately — causing a rapid wake-sleep cycle under full LTE RF load that both ran the modem hot and caused intermittent GPS read failures. With the modem always awake, GPS reads succeed reliably on every main loop tick.
 
+### 11. 10-second track recording with batched send (v2.3.17)
+While moving, a GPS sample (lat/lon/derived speed/GPS timestamp) is recorded every 10 seconds into a ring buffer — but only if the device has moved ≥25 m since the last recorded point, so parking records nothing. At ping time the whole buffer is sent inside a single HTTP session, one request per point with its own `timestamp=`, giving 10-second track resolution on the map while the radio only performs session setup once per ping interval. Failed sends keep unsent samples buffered for the next ping (up to ~10 minutes of history).
+
+### 12. Ignition detection + power-cut alarm (v2.3.18)
+Both derived from the main-supply voltage already measured for `vbat`:
+- **Ignition** — the alternator lifts the vehicle bus above ~13.3 V when the engine runs; below 13.0 V it's off (3-second debounce). Reported as `ignition=true/false` on every ping.
+- **Power-cut alarm** — if the main supply drops below 7.5 V (device running on backup Li-Po), an immediate ping carries `alarm=powerCut`; restoration above 8 V sends `alarm=powerRestored`. Traccar recognises these natively — add a Notification of type *Alarm* to get alerted. The alarm is cleared only after a confirmed successful send.
+
 ---
 
 ## Works With
@@ -117,6 +125,8 @@ After the initial flash, subsequent updates are delivered via OTA — no USB acc
 
 | Version | Changes |
 |---|---|
+| **2.3.18** | Ignition detection from main-supply voltage (>13.3 V = engine on, <13.0 V = off, 3 s debounce), reported as `ignition=true/false`. Power-cut alarm: main supply lost (<7.5 V, running on backup LiPo) sends an immediate `alarm=powerCut` ping; restore sends `alarm=powerRestored`. Alarms survive failed sends. |
+| **2.3.17** | 10-second GPS track recording: positions sampled into a 64-entry ring buffer while moving (≥25 m spacing), drained as a batch inside the ping HTTP session with per-point timestamps — 10 s track resolution at one session setup per ping. OTA download fix: stale `+HTTPREAD: 0` end markers no longer abort the download (root cause of OTA never completing). **First firmware delivered fully over the air.** |
 | **2.3.16** | HTTP 200 with empty body now treated as success. Traccar's OsmAnd endpoint returns `200` with zero-byte body; firmware was treating the subsequent `AT+HTTPREAD` failure as a ping failure and retrying every ~11 s instead of every 30 s. |
 | **2.3.15** | OTA startup reliability: 10 s delay after network init before first OTA check (gives LTE data plane time to stabilise); version fetch retried once after 5 s on failure. Removed remaining `AT+CSCLK=2` calls from SMS/SOS legacy code paths. |
 | **2.3.14** | Removed `AT+CSCLK=2` from modem init and `XHTTP_Request` — modem stays at `CSCLK=0` so GPS polling succeeds reliably (root cause of missing trip data). Motion threshold default lowered from 18 → 4 counts with auto-migration on first boot. Periodic OTA check every 24 hr without reboot. `Moved V_OTA` Traccar command for immediate OTA check. |
