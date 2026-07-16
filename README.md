@@ -10,7 +10,7 @@ Based on the original firmware by [Valetron Systems](https://www.valetron.com/).
 
 - **Device:** VALTRACK-V4-VTS-ESP32-C3
 - **MCU:** ESP32-C3 (RISC-V, BLE, Wi-Fi)
-- **Modem:** SIMCom SIM7672G (4G LTE CAT1 + GNSS)
+- **Modem:** SIMCom A7672G (4G LTE CAT1 + GNSS)
 - **Power input:** 12V–42V DC (VCHG) with reverse polarity protection
 - **Connectivity:** 4G LTE — requires SIM card with data
 
@@ -40,7 +40,7 @@ Three-tier power/reporting state machine driven by the onboard LIS3DH accelerome
 | State | Condition | Report interval | Power |
 |---|---|---|---|
 | Moving | Motion within last 5 min | 30 s (configured via BT app) | Normal |
-| Parked short | No motion 5 min – 48 hr | 5 min | Modem light sleep between reports |
+| Parked short | No motion 5 min – 48 hr | 5 min | Normal (modem stays awake — see §10) |
 | Parked long | No motion ≥ 48 hr | Deep sleep + 8 hr heartbeat | ~negligible |
 
 - On each heartbeat wakeup (8 hr timer), the device sends one position report then returns to deep sleep
@@ -48,7 +48,7 @@ Three-tier power/reporting state machine driven by the onboard LIS3DH accelerome
 - The 48 hr threshold is intentional: a daily driver parked Friday–Monday stays in parked-short mode over the weekend rather than entering deep sleep mid-weekend
 
 ### 5. OTA firmware updates
-The device checks for a new firmware version on each boot. If the OTA server reports a newer version, the binary is downloaded over LTE and written to the inactive OTA partition. The device reboots into the new firmware; if it crashes before marking itself valid the bootloader auto-rolls back to the previous version. The partition is marked valid as soon as basic init completes — a transient modem failure does not trigger a rollback.
+The device checks for a new firmware version on each boot, every 24 hours while running, and on demand via the `V_OTA` remote command. If the OTA server reports a newer version, the binary is downloaded over LTE and written to the inactive OTA partition. The device reboots into the new firmware; if it crashes before marking itself valid the bootloader auto-rolls back to the previous version. The partition is marked valid as soon as basic init completes — a transient modem failure does not trigger a rollback.
 
 - Partition layout: dual OTA (`ota_0` @ 0x20000, `ota_1` @ 0x110000, each 960 KB) with `otadata` at 0xF000
 - Version manifest: `GET http://ota.pawson.co.nz/version.json` → `{"ver":"x.y.z"}`
@@ -65,7 +65,7 @@ Send commands to a device through Traccar's **Custom Command** (`Moved <CMD>`):
 | `Moved V_OTA` | Trigger an OTA check immediately without rebooting |
 
 ### 7. Speed derivation
-The SIM7672G/A7672 modem reports speed = 0 even when moving. Speed is now derived from consecutive lat/lon positions divided by the reporting interval, so Traccar trip detection works correctly.
+The A7672G modem reports speed = 0 even when moving. Speed is derived from consecutive lat/lon positions divided by the interval between them, and sent in knots (which Traccar's OsmAnd decoder expects), so Traccar trip detection and speed display work correctly.
 
 ### 8. GPS sanity filter + last-known-position cache
 Cold-start artifacts near (0°, 0°–3°) are rejected before being sent. When the GNSS module has no current fix, the last known valid position is reported instead, keeping the device visible on the map. Reports are blocked only if no fix has ever been obtained in the current session.
@@ -94,15 +94,26 @@ Both derived from the main-supply voltage already measured for `vbat`:
 
 ## Server Configuration
 
-In Traccar, add the device using its IMEI as the identifier. The OsmAnd protocol is enabled by default on port 5055. No additional server-side configuration is required — custom attributes (`vbat`, `ncsq`) are stored automatically.
+In Traccar, add the device using its IMEI as the identifier. The OsmAnd protocol is enabled by default on port 5055. No additional server-side configuration is required — custom attributes (`vbat`, `ncsq`, `fwver`, `ignition`) are stored automatically, and `alarm=powerCut`/`powerRestored` raise native Traccar alarm events (add a Notification of type *Alarm* to be alerted).
+
+Recommended `traccar.xml` filter settings (note `filter.future` takes **seconds**, not a boolean — a non-numeric value throws a per-position exception that silently disables all filtering):
+
+```xml
+<entry key="filter.enable">true</entry>
+<entry key="filter.zero">true</entry>
+<entry key="filter.duplicate">true</entry>
+<entry key="filter.future">86400</entry>
+<entry key="filter.maxSpeed">300</entry>
+<entry key="filter.distance">40</entry>
+```
 
 ---
 
 ## Build Environment
 
-- ESP-IDF (v5.x)
+- ESP-IDF v6.0.1 (via PlatformIO's framework-espidf package; build with ninja in `build/`)
 - PlatformIO with `valtrack_v4_vts_esp32_c3` board ID, or Arduino IDE with `esp32-c3-devkitm-1`
-- USB programming via micro USB (no boot buttons required with `--before default-reset`)
+- USB programming via micro USB (no boot buttons required with `--before default-reset`; some units need `--no-stub` at 115200 baud)
 
 ## Flashing
 
