@@ -528,6 +528,29 @@ static int heartbeat_wake = 0;   // 1 when woken by 8hr timer; cleared after fir
 uint32_t ota_check_timer = 0;   // seconds since last OTA check; 24hr periodic check
 float last_good_lat = 0.0f; // last GPS fix — persisted to NVS, survives reboots
 float last_good_lon = 0.0f;
+
+/* 10-second GPS track buffer. Samples recorded while moving; drained as a
+   batch inside the ping HTTP session so track resolution is 10s while the
+   radio only does full session setup once per ping interval.
+   Single producer (timer task) / single consumer (main task) ring. */
+#define TRACK_SAMPLE_SECONDS 10
+#define TRACK_BUF_SIZE       64   // ~10 min of moving data if sends fail
+typedef struct {
+    float lat, lon, speed;
+    unsigned char yy, mo, dd, hh, mi, ss;  // GPS UTC at sample time
+} TrackSample;
+static TrackSample track_buf[TRACK_BUF_SIZE];
+static volatile unsigned short track_head = 0, track_tail = 0;
+static float track_last_lat = 0.0f, track_last_lon = 0.0f;
+
+/* Ignition + external-power sensing from the main supply voltage (VCHG ADC).
+   Alternator lifts the vehicle bus above ~13.3V when the engine runs; engine
+   off sits ~12.x V; main power cut drops below ~1V (backup LiPo keeps the
+   device alive). Reported as ignition=true/false; transitions of external
+   power send alarm=powerCut / alarm=powerRestored on an immediate ping. */
+static int ign_on = 0;        // debounced ignition state
+static int extpwr_on = -1;    // -1 until first debounced reading after boot
+static volatile int power_alarm = 0; // 1=powerCut, 2=powerRestored; cleared after successful send
 unsigned short HeartBeatTimer = 0;
 unsigned short NoSignalTimer=0;
 unsigned short ButtonPressTimer=0;
@@ -1193,6 +1216,72 @@ void LoadGPSTimeStamp(HWEventDataType *pPacket)
     pPacket->GEvent.Long    = fLong;
     pPacket->GEvent.Speed   = fSpeed;
 }
+
+/* Record one GPS track sample if we have a valid fix and have moved since
+   the last recorded point. Called every TRACK_SAMPLE_SECONDS from the 1s
+   timer tick. Parked (no movement) records nothing — the regular ping
+   still reports the position. */
+static void TrackSampleTick(void)
+{
+    if (GPSStatus != 'A') return;
+    float lat = fLat, lon = fLong;
+    if (lat == 0.0f && lon == 0.0f) return;
+    if (lat > -1.0f && lat < 1.0f && lon > -1.0f && lon < 3.0f) return; // cold-start artifact
+    if (lat < -90.0f || lat > 90.0f || lon < -180.0f || lon > 180.0f) return;
+
+    float dlat_m = (lat - track_last_lat) * 111000.0f;
+    float dlon_m = (lon - track_last_lon) * 86000.0f;
+    float dist_sq = dlat_m * dlat_m + dlon_m * dlon_m;
+    if (track_last_lat != 0.0f && dist_sq < (25.0f * 25.0f)) return; // <25m — parked/idle
+
+    unsigned short next = (track_tail + 1) % TRACK_BUF_SIZE;
+    if (next == track_head)
+        track_head = (track_head + 1) % TRACK_BUF_SIZE; // full — drop oldest
+
+    TrackSample *s = &track_buf[track_tail];
+    s->lat = lat;
+    s->lon = lon;
+    /* Modem reports speed=0 even when moving; derive from distance covered
+       since the previous sample. */
+    s->speed = 0.0f;
+    if (track_last_lat != 0.0f) {
+        float kmh = sqrtf(dist_sq) * 3.6f / (float)TRACK_SAMPLE_SECONDS;
+        if (kmh < 300.0f) s->speed = kmh;
+    }
+    s->yy = GPSYear;  s->mo = GPSMonth;   s->dd = GPSDay;
+    s->hh = GPSHours; s->mi = GPSMinutes; s->ss = GPSSeconds;
+    track_tail = next;
+
+    track_last_lat = lat;
+    track_last_lon = lon;
+}
+
+/* Debounced ignition + external-power state from ADCBatteryVoltage.
+   Called every second from the timer tick. 3s debounce on all transitions. */
+static void PowerSenseTick(void)
+{
+    float v = ADCBatteryVoltage;
+    static int ign_cnt = 0, pwr_cnt = 0;
+
+    /* Ignition: on above 13.3V (alternator), off below 13.0V. */
+    if (ign_on ? (v < 13.0f) : (v > 13.3f)) {
+        if (++ign_cnt >= 3) { ign_on = !ign_on; ign_cnt = 0; }
+    } else {
+        ign_cnt = 0;
+    }
+
+    /* External power: present above 8V, lost below 7.5V (7.5–8V = hysteresis). */
+    int present = (v > 8.0f) ? 1 : (v < 7.5f) ? 0 : -1;
+    if (present < 0 || present == extpwr_on) { pwr_cnt = 0; return; }
+    if (++pwr_cnt < 3) return;
+    pwr_cnt = 0;
+    if (extpwr_on != -1) {   // no alarm for the first reading after boot
+        power_alarm = present ? 2 : 1;
+        force_ping_now = 1;  // report the transition immediately
+    }
+    extpwr_on = present;
+}
+
 void PostMotionEvent(void)
 {
     
@@ -2823,6 +2912,9 @@ void StartTimerTask(void *argument)
             ParkLongTimer++;
         #endif
         ota_check_timer++;
+        if (SystemTimer % TRACK_SAMPLE_SECONDS == 0)
+            TrackSampleTick();
+        PowerSenseTick();
 //        #ifndef MOTION_CONTROLLED_PINGS
 //        MotionTimer=0;
 //        #endif
@@ -4187,6 +4279,52 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         
     }
     //IWDG_ReloadCounter();
+
+    /* Drain buffered 10s track samples inside this HTTP session — one
+       HTTPPARA/HTTPACTION per sample, each with its own timestamp, no
+       per-sample session setup. On any failure, remaining samples stay
+       buffered and are retried on the next ping. */
+    while (track_head != track_tail)
+    {
+        TrackSample *smp = &track_buf[track_head];
+        size_t _ulen = strlen(Params.Fields.HTTPURL);
+        const char *_sep = (_ulen > 0 && Params.Fields.HTTPURL[_ulen-1] == '/') ? "" : "/";
+        snprintf(str, sizeof(str),
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f&timestamp=%ld&fwver=" FW_VERSION,
+            Params.Fields.HTTPURL, _sep, IMEI,
+            smp->lat, smp->lon, smp->speed,
+            osmand_unix_ts(smp->yy, smp->mo, smp->dd, smp->hh, smp->mi, smp->ss));
+        ResetBuffer();
+        Print("AT+HTTPPARA=\"URL\",\"");
+        Print(str);
+        Print("\"\r\n");
+        LoopTimeout1 = 0;
+        while(1)
+        {
+            if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL) break;
+            if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
+            {   goto exit; }
+        }
+        ResetBuffer();
+        Print("AT+HTTPACTION=0\r\n");
+        LoopTimeout1 = 0;
+        while(1)
+        {
+            if(MapForward(Buff2,BUFF2_SIZE,(char*)"ACTION:",7) != NULL) break;
+            if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>60))
+            {   goto exit; }
+        }
+        osDelay(300); // let the rest of the +HTTPACTION: 0,<code>,<size> URC arrive
+        {
+            char *_p = MapForward(Buff2, BUFF2_SIZE, (char*)"+HTTPACTION:", 12);
+            if (!_p) goto exit;
+            while (*_p && *_p != ',') _p++;
+            if (*_p == ',') _p++;
+            if (atoi(_p) != 200) goto exit;
+        }
+        track_head = (track_head + 1) % TRACK_BUF_SIZE;
+    }
+
     ResetBuffer();
     /* OsmAnd GET URL: base URL (from BT-app config) + query params.
        Always insert '/' before '?' so the request URI is valid (some HTTP stacks
@@ -4194,14 +4332,18 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     {
         size_t _ulen = strlen(Params.Fields.HTTPURL);
         const char *_sep = (_ulen > 0 && Params.Fields.HTTPURL[_ulen-1] == '/') ? "" : "/";
+        const char *_alarm = (power_alarm == 1) ? "&alarm=powerCut"
+                           : (power_alarm == 2) ? "&alarm=powerRestored" : "";
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f&timestamp=%ld&vbat=%f&ncsq=%s&fwver=" FW_VERSION,
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f&timestamp=%ld&vbat=%f&ncsq=%s&ignition=%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed,
         osmand_unix_ts(pPacket->GEvent.Year, pPacket->GEvent.Month, pPacket->GEvent.Date,
                        pPacket->GEvent.Hours, pPacket->GEvent.Minutes, pPacket->GEvent.Seconds),
         pPacket->GEvent.Voltage,
-        SignalStrength);
+        SignalStrength,
+        ign_on ? "true" : "false",
+        _alarm);
     }
     Print("AT+HTTPPARA=\"URL\",\"");
     Print(str);
@@ -4241,6 +4383,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     }
     // OsmAnd protocol returns HTTP 200 with 0-byte body — HTTPREAD would ERROR.
     // Parse +HTTPACTION: 0,<code>,<size>; if 200 + empty body, accept immediately.
+    osDelay(300); // let the rest of the +HTTPACTION: 0,<code>,<size> URC arrive
     {
         char *_p = MapForward(Buff2, BUFF2_SIZE, (char*)"+HTTPACTION:", 12);
         if (_p) {
@@ -4399,6 +4542,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     //free(string);
 SUCCESS:
     esp_ota_mark_app_valid_cancel_rollback();
+    power_alarm = 0; // alarm delivered; a failed send keeps it for the retry
     ClearEventCache();
     if(RFIDDataPresent==1)
     {
@@ -7736,9 +7880,18 @@ void CheckAndApplyOTA(void)
         uart_write_bytes(UART_PORT_NUM, str, strlen(str));
 
         int total_received = 0;
+        int zero_headers = 0;
         while (total_received < this_chunk) {
             int header_n = ota_read_httpread_header(30000);
-            if (header_n <= 0) { download_ok = false; break; }
+            if (header_n < 0) { download_ok = false; break; }
+            if (header_n == 0) {
+                /* "+HTTPREAD: 0" is the modem's end-of-response marker. One
+                   left over from the previous chunk can arrive after the
+                   inter-chunk flush (timing race) — skip it. More than a few
+                   means the modem actually ended the data stream early. */
+                if (++zero_headers > 3) { download_ok = false; break; }
+                continue;
+            }
             if (!ota_read_exact(chunk_buf + total_received, header_n, 60000)) { download_ok = false; break; }
             total_received += header_n;
         }
