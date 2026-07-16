@@ -125,6 +125,8 @@ After the initial flash, subsequent updates are delivered via OTA — no USB acc
 
 | Version | Changes |
 |---|---|
+| **2.3.20** | Fixed phantom deep sleep after software resets: the wakeup-cause register survives `esp_restart`, and a stale TIMER bit at boot was misread as an 8 hr heartbeat wake — sending a stationary device into real deep sleep minutes after an OTA/V_RESET reboot. Wakeup cause is now only trusted when the reset reason is deep sleep. |
+| **2.3.19** | GPS field buffers cleared after each parse — the modem leaves the speed field empty when stationary, so the last driving speed was frozen and re-reported forever while parked. Speed now sent in knots (Traccar's OsmAnd decoder expects knots; km/h values were over-reported 1.85×). |
 | **2.3.18** | Ignition detection from main-supply voltage (>13.3 V = engine on, <13.0 V = off, 3 s debounce), reported as `ignition=true/false`. Power-cut alarm: main supply lost (<7.5 V, running on backup LiPo) sends an immediate `alarm=powerCut` ping; restore sends `alarm=powerRestored`. Alarms survive failed sends. |
 | **2.3.17** | 10-second GPS track recording: positions sampled into a 64-entry ring buffer while moving (≥25 m spacing), drained as a batch inside the ping HTTP session with per-point timestamps — 10 s track resolution at one session setup per ping. OTA download fix: stale `+HTTPREAD: 0` end markers no longer abort the download (root cause of OTA never completing). **First firmware delivered fully over the air.** |
 | **2.3.16** | HTTP 200 with empty body now treated as success. Traccar's OsmAnd endpoint returns `200` with zero-byte body; firmware was treating the subsequent `AT+HTTPREAD` failure as a ping failure and retrying every ~11 s instead of every 30 s. |
