@@ -525,6 +525,7 @@ volatile int   force_ping_now = 0; // set by PING_NOW remote command; cleared af
 unsigned short MotionTimer=0;
 uint32_t ParkLongTimer = 0;      // seconds since last motion; 48hr threshold → deep sleep
 static int heartbeat_wake = 0;   // 1 when woken by 8hr timer; cleared after first ping
+uint32_t ota_check_timer = 0;   // seconds since last OTA check; 24hr periodic check
 float last_good_lat = 0.0f; // last GPS fix — persisted to NVS, survives reboots
 float last_good_lon = 0.0f;
 unsigned short HeartBeatTimer = 0;
@@ -615,7 +616,7 @@ const ParamsType DefaultParams = {
          10,//unsigned int PingInterval;
         "HTTP",//"TCP",//char WorkingMode[5];
         "NONE",//"CALL",//char MotionAlertMode[5];
-        0x12,//char MotionThreshold;
+        0x04,//char MotionThreshold;
         "http://domain.com/api/update",//char HTTPURL[150];,
         "Your-Api-Key: 1234456789",///char HTTPKey[100];
         "www",//"iot.1nce.net",//char APNName[20];
@@ -2586,13 +2587,10 @@ unsigned char InitGSM(void)
     //GetNetworkData();
     CheckNetworkLocation();
     
-    #ifndef SIM7672
-    SendATCommand("AT+CSCLK=2\r\n","OK","ERROR",5);
-    #else
-    SendATCommand("AT+CSCLK=0\r\n","OK","ERROR",5);// SIM7672 takes it seriously and doesnt respond
-    #endif
+    // Keep modem awake (CSCLK=0) so XCheckGPS AT+CGPSINFO succeeds reliably
+    SendATCommand("AT+CSCLK=0\r\n","OK","ERROR",5);
     // CheckNetworkLocation();
-    
+
     #ifdef EXT_ANT_ENABLED
         XCheckGPS();    // Here for getting time stamp in reboot ping
     #endif
@@ -2824,6 +2822,7 @@ void StartTimerTask(void *argument)
         if (ParkLongTimer <= PARK_LONG_SECONDS)
             ParkLongTimer++;
         #endif
+        ota_check_timer++;
 //        #ifndef MOTION_CONTROLLED_PINGS
 //        MotionTimer=0;
 //        #endif
@@ -4240,9 +4239,24 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     {
         memset(query,0,sizeof(query));
     }
+    // OsmAnd protocol returns HTTP 200 with 0-byte body — HTTPREAD would ERROR.
+    // Parse +HTTPACTION: 0,<code>,<size>; if 200 + empty body, accept immediately.
+    {
+        char *_p = MapForward(Buff2, BUFF2_SIZE, (char*)"+HTTPACTION:", 12);
+        if (_p) {
+            while (*_p && *_p != ',') _p++;
+            if (*_p == ',') _p++;
+            if (atoi(_p) == 200) {
+                while (*_p && *_p != ',') _p++;
+                if (*_p == ',') _p++;
+                if (atoi(_p) == 0) goto SUCCESS;
+            }
+        }
+    }
+
     osDelay(1000);
     ResetBuffer();
-    
+
     SendATCommand("AT+HTTPREAD=0,50\r\n","+HTTPREAD: ","ERROR",10);
     //Print("AT+HTTPREAD=0,50\r\n");
     //DelayProc(850000);
@@ -4287,6 +4301,14 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
                 Print("AT+HTTPTERM\r\n");
                 osDelay(500);
                 esp_restart();
+            }
+            if(MapForward(Buff2,BUFF2_SIZE,(char*)"V_OTA",5) != NULL)
+            {
+                /* Remote OTA check via Traccar custom command "Moved V_OTA".
+                   Runs CheckAndApplyOTA immediately; reboots if update found. */
+                Print("AT+HTTPTERM\r\n");
+                osDelay(500);
+                ota_check_timer = 86400UL; // trigger periodic OTA path on next loop
             }
             if(MapForward(Buff2,BUFF2_SIZE,(char*)"PING_NOW",8) != NULL)
             {
@@ -4397,16 +4419,12 @@ SUCCESS:
         
     }       
     // SendATCommand("AT+CFUN=0\r\n","OK","ERROR",5);
-    #ifndef SIM7672
-    SendATCommand("AT+CSCLK=2\r\n","OK","ERROR",5);
-    #else
-    SendATCommand("AT+CSCLK=0\r\n","OK","ERROR",5);// SIM7672 takes it seriously and doesnt respond
-    #endif
-    
+    // Modem stays at CSCLK=0 so XCheckGPS GPS reads succeed in the main loop
+
     //Print4("SUCCESS\r\n");
     retVal=0;
     return 0;
-exit: 
+exit:
     ResetBuffer();
     Print("AT+HTTPTERM\r\n");
     LoopTimeout1 = 0;
@@ -4416,13 +4434,8 @@ exit:
                 break;
         if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
         {       break; }
-        
+
     }
-    #ifndef SIM7672
-    SendATCommand("AT+CSCLK=2\r\n","OK","ERROR",5);
-    #else
-    SendATCommand("AT+CSCLK=0\r\n","OK","ERROR",5);// SIM7672 takes it seriously and doesnt respond
-    #endif
     //Print4("FAILED\r\n");
     
     /*if(PGEvent.EventType == 35 && retries >=1 && Params.Fields.PingInterval <=10)
@@ -6432,6 +6445,7 @@ ESP_LOGI(TAG,"Entered main task");
     //GetNetworkData();
     //
     SyncRTC();
+    osDelay(10000); // Let LTE data routing stabilize before attempting OTA HTTP
     CheckAndApplyOTA();
     /* Restore last known position from NVS so we can ping Traccar immediately
        after reboot without waiting for a GPS fix. */
@@ -6735,10 +6749,6 @@ ESP_LOGI(TAG,"Entered main task");
                     SosAlert=0;
                     osDelay(3000);
                     ResetBuffer();
-                    Print("AT+CSCLK=2\r\n");
-                    osDelay(2000);
-                    
-                    
                     DDelay();
                 }
             }
@@ -6799,12 +6809,8 @@ ESP_LOGI(TAG,"Entered main task");
                     DDelay();
                     osDelay(3000);
                     ResetBuffer();
-                    Print("AT+CSCLK=2\r\n");
-                    osDelay(2000);
-                    
-                    
                     DDelay();
-                        
+
                 }
                 if(Params.Fields.MotionAlertMode[0]=='C')
                 {
@@ -6851,7 +6857,12 @@ ESP_LOGI(TAG,"Entered main task");
             }
             //CheckSignalStrength();
             CheckNetworkLocation();
-            // SendATCommand("AT+CFUN=0\r\n","OK","ERROR",5); 
+            // SendATCommand("AT+CFUN=0\r\n","OK","ERROR",5);
+        }
+        // Periodic OTA check every 24 hours (86400s). Startup check at boot covers the first run.
+        if (ota_check_timer >= 86400UL) {
+            ota_check_timer = 0;
+            CheckAndApplyOTA();
         }
         if(Params.Fields.WorkingMode[0]=='S')
         {            
@@ -6882,14 +6893,8 @@ ESP_LOGI(TAG,"Entered main task");
 				osDelay(3000);
                 SMSSent = 1;
                 DDelay();
-                ResetBuffer();
-                Print("AT+CSCLK=2\r\n");
-                osDelay(2000);
-                
-                
-                DDelay();
                 NoSignalTimer=0;
-                
+
             }
             if(GPSStatus != 'A' && SMSSent == 0 && NoSignalTimer > 120)
             {
@@ -6921,14 +6926,7 @@ ESP_LOGI(TAG,"Entered main task");
                 SMSSent = 1;
                 NoSignalTimer = 0;
                 DDelay();
-                ResetBuffer();
-                Print("AT+CSCLK=2\r\n");
-                osDelay(2000);
-                
-                
-                DDelay();
-                
-                
+
             }
                 
             //if( GPIO_ReadInputDataBit(GPIOA,GPIO_Pin_6) != 0 ) 
@@ -7658,20 +7656,34 @@ void CheckAndApplyOTA(void)
 
     ESP_LOGI(TAG, "OTA: check %s (running %s)", OTA_VERSION_URL, FW_VERSION);
 
-    if (!ota_network_up()) {
-        ESP_LOGW(TAG, "OTA: PDP context failed, skipping");
+    // ---- Step 1: fetch version.json (retry once if first attempt fails) ----
+    bool version_ok = false;
+    for (int otry = 0; otry < 2 && !version_ok; otry++) {
+        if (otry > 0) {
+            ESP_LOGW(TAG, "OTA: version fetch failed, retrying in 5s");
+            osDelay(5000);
+        }
+        if (!ota_network_up()) {
+            ESP_LOGW(TAG, "OTA: PDP context failed (attempt %d)", otry + 1);
+            continue;
+        }
+        ota_http_open(OTA_VERSION_URL);
+        if (ota_http_action_size() < 0) { ota_http_close(); continue; }
+        osDelay(500);
+        ResetBuffer();
+        SendATCommand("AT+HTTPREAD=0,200\r\n", "+HTTPREAD:", "ERROR", 10);
+        osDelay(300);
+        if (ota_parse_version(server_ver, sizeof(server_ver))) {
+            ota_http_close();
+            version_ok = true;
+        } else {
+            ota_http_close();
+        }
+    }
+    if (!version_ok) {
+        ESP_LOGW(TAG, "OTA: version check failed, skipping");
         return;
     }
-
-    // ---- Step 1: fetch version.json ----
-    ota_http_open(OTA_VERSION_URL);
-    if (ota_http_action_size() < 0) goto ota_abort;
-    osDelay(500);
-    ResetBuffer();
-    SendATCommand("AT+HTTPREAD=0,200\r\n", "+HTTPREAD:", "ERROR", 10);
-    osDelay(300);
-    if (!ota_parse_version(server_ver, sizeof(server_ver))) goto ota_abort;
-    ota_http_close();
 
     ESP_LOGI(TAG, "OTA: running=%s server=%s", FW_VERSION, server_ver);
     if (strcmp(FW_VERSION, server_ver) == 0) {
@@ -7807,7 +7819,15 @@ void app_main(void)
     //StoreEEParams();
     GetEEParams();
 
-    
+    // Migrate MotionThreshold from old default (0x12=18) to new sensitive value (0x04=4)
+    if (Params.Fields.MotionThreshold == 0x12) {
+        char mstr[10];
+        Params.Fields.MotionThreshold = 0x04;
+        sprintf(mstr, "%d", Params.Fields.MotionThreshold);
+        StoreParamString("MotionThreshold", mstr);
+        ESP_LOGI(TAG, "Migrated MotionThreshold 0x12->0x04");
+    }
+
     //esp_nimble_hci_and_controller_init();      // 2 - Initialize ESP controller
     nimble_port_init();                        // 3 - Initialize the host stack
     ble_svc_gap_init();                        // 4 - Initialize NimBLE configuration - gap service

@@ -62,6 +62,7 @@ Send commands to a device through Traccar's **Custom Command** (`Moved <CMD>`):
 |---|---|
 | `Moved V_RESET` | Reboot the device (triggers OTA check on next boot) |
 | `Moved PING_NOW` | Force an immediate position report |
+| `Moved V_OTA` | Trigger an OTA check immediately without rebooting |
 
 ### 7. Speed derivation
 The SIM7672G/A7672 modem reports speed = 0 even when moving. Speed is now derived from consecutive lat/lon positions divided by the reporting interval, so Traccar trip detection works correctly.
@@ -70,7 +71,10 @@ The SIM7672G/A7672 modem reports speed = 0 even when moving. Speed is now derive
 Cold-start artifacts near (0°, 0°–3°) are rejected before being sent. When the GNSS module has no current fix, the last known valid position is reported instead, keeping the device visible on the map. Reports are blocked only if no fix has ever been obtained in the current session.
 
 ### 9. Multi-constellation GNSS + AGPS (v2.3.8)
-`AT+CGNSSMODE=15` and `AT+CGPSXE=1` are sent at GPS power-on to request GPS + GLONASS + BeiDou + Galileo and XTRA extended ephemeris. **Note:** both commands return `ERROR` on the SIM7672G modem firmware shipped with this hardware — they are prepared but have no effect until Valetron ships a modem firmware update that supports them.
+`AT+CGNSSMODE=15` and `AT+CGPSXE=1` are sent at GPS power-on to request GPS + GLONASS + BeiDou + Galileo and XTRA extended ephemeris. **Note:** both commands return `ERROR` on the A7672G modem firmware shipped with this hardware — they are prepared but have no effect until Valetron ships a modem firmware update that supports them.
+
+### 10. Modem always-on (no CSCLK sleep) (v2.3.14)
+`AT+CSCLK=2` (modem slow-clock sleep) was removed from all code paths. The A7672G modem now stays at `AT+CSCLK=0` (always awake). Previously, the modem was put to sleep after each HTTP ping, but the GPS polling loop (`AT+CGPSINFO` every second) was waking it again immediately — causing a rapid wake-sleep cycle under full LTE RF load that both ran the modem hot and caused intermittent GPS read failures. With the modem always awake, GPS reads succeed reliably on every main loop tick.
 
 ---
 
@@ -113,6 +117,9 @@ After the initial flash, subsequent updates are delivered via OTA — no USB acc
 
 | Version | Changes |
 |---|---|
+| **2.3.16** | HTTP 200 with empty body now treated as success. Traccar's OsmAnd endpoint returns `200` with zero-byte body; firmware was treating the subsequent `AT+HTTPREAD` failure as a ping failure and retrying every ~11 s instead of every 30 s. |
+| **2.3.15** | OTA startup reliability: 10 s delay after network init before first OTA check (gives LTE data plane time to stabilise); version fetch retried once after 5 s on failure. Removed remaining `AT+CSCLK=2` calls from SMS/SOS legacy code paths. |
+| **2.3.14** | Removed `AT+CSCLK=2` from modem init and `XHTTP_Request` — modem stays at `CSCLK=0` so GPS polling succeeds reliably (root cause of missing trip data). Motion threshold default lowered from 18 → 4 counts with auto-migration on first boot. Periodic OTA check every 24 hr without reboot. `Moved V_OTA` Traccar command for immediate OTA check. |
 | **2.3.13** | OTA rollback-timing fix: partition marked valid before `InitGSM()` so modem failures don't trigger rollback. OTA download redesigned: full binary buffered once in modem HTTP RAM via single `AT+HTTPACTION=0`, read sequentially with `AT+HTTPREAD=<offset>,<len>` — eliminates 165 per-chunk HTTP connections and the `+HTTPREAD: 0` residual bug that was aborting downloads. |
 | **2.3.8** | Multi-constellation GNSS (`AT+CGNSSMODE=15`) and XTRA AGPS (`AT+CGPSXE=1`) commands added at GPS init (commands return ERROR on current modem firmware — no-op until modem update). |
 | **2.3.7** | Fixed `uart_event_task` crash on null byte in modem URC stream. |
