@@ -1227,6 +1227,10 @@ void LoadGPSTimeStamp(HWEventDataType *pPacket)
    still reports the position. */
 static void TrackSampleTick(void)
 {
+    /* LIS3DH gate: no physical motion for 60s = parked. GPS jitter while
+       parked exceeds the 5m spacing gate and records phantom movement
+       (0.5-2.5kn "speeds" on a stationary vehicle) without this. */
+    if (MotionTimer > 60) return;
     if (GPSStatus != 'A') return;
     float lat = fLat, lon = fLong;
     if (lat == 0.0f && lon == 0.0f) return;
