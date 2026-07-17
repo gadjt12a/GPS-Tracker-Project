@@ -529,12 +529,12 @@ uint32_t ota_check_timer = 0;   // seconds since last OTA check; 24hr periodic c
 float last_good_lat = 0.0f; // last GPS fix — persisted to NVS, survives reboots
 float last_good_lon = 0.0f;
 
-/* 10-second GPS track buffer. Samples recorded while moving; drained as a
-   batch inside the ping HTTP session so track resolution is 10s while the
+/* 1-second GPS track buffer. Samples recorded while moving; drained as a
+   batch inside the ping HTTP session so track resolution is 1s while the
    radio only does full session setup once per ping interval.
    Single producer (timer task) / single consumer (main task) ring. */
-#define TRACK_SAMPLE_SECONDS 10
-#define TRACK_BUF_SIZE       64   // ~10 min of moving data if sends fail
+#define TRACK_SAMPLE_SECONDS 1
+#define TRACK_BUF_SIZE       256  // ~4 min of moving data if sends fail
 typedef struct {
     float lat, lon, speed;
     unsigned char yy, mo, dd, hh, mi, ss;  // GPS UTC at sample time
@@ -542,6 +542,10 @@ typedef struct {
 static TrackSample track_buf[TRACK_BUF_SIZE];
 static volatile unsigned short track_head = 0, track_tail = 0;
 static float track_last_lat = 0.0f, track_last_lon = 0.0f;
+static float track_live_speed_kmh = 0.0f; // latest track-derived speed; live ping reports it
+static int64_t track_live_speed_us = 0;   // esp_timer time of that sample
+static long track_prev_ts = 0;            // GPS unix ts of previous recorded sample
+static long osmand_unix_ts(int yy, int mo, int dd, int hh, int mi, int ss);
 
 /* Ignition + external-power sensing from the main supply voltage (VCHG ADC).
    Alternator lifts the vehicle bus above ~13.3V when the engine runs; engine
@@ -1232,7 +1236,11 @@ static void TrackSampleTick(void)
     float dlat_m = (lat - track_last_lat) * 111000.0f;
     float dlon_m = (lon - track_last_lon) * 86000.0f;
     float dist_sq = dlat_m * dlat_m + dlon_m * dlon_m;
-    if (track_last_lat != 0.0f && dist_sq < (25.0f * 25.0f)) return; // <25m — parked/idle
+    if (track_last_lat != 0.0f && dist_sq < (5.0f * 5.0f)) return; // <5m — parked/idle
+
+    long ts = osmand_unix_ts(GPSYear, GPSMonth, GPSDay,
+                             GPSHours, GPSMinutes, GPSSeconds);
+    if (ts != 0 && ts == track_prev_ts) return; // same GPS second — no new fix yet
 
     unsigned short next = (track_tail + 1) % TRACK_BUF_SIZE;
     if (next == track_head)
@@ -1242,12 +1250,15 @@ static void TrackSampleTick(void)
     s->lat = lat;
     s->lon = lon;
     /* Modem reports speed=0 even when moving; derive from distance covered
-       since the previous sample. */
+       over the actual elapsed time since the previous recorded sample. */
     s->speed = 0.0f;
-    if (track_last_lat != 0.0f) {
-        float kmh = sqrtf(dist_sq) * 3.6f / (float)TRACK_SAMPLE_SECONDS;
+    if (track_last_lat != 0.0f && track_prev_ts != 0 && ts > track_prev_ts) {
+        float kmh = sqrtf(dist_sq) * 3.6f / (float)(ts - track_prev_ts);
         if (kmh < 300.0f) s->speed = kmh;
     }
+    track_prev_ts = ts;
+    track_live_speed_kmh = s->speed;
+    track_live_speed_us = esp_timer_get_time();
     s->yy = GPSYear;  s->mo = GPSMonth;   s->dd = GPSDay;
     s->hh = GPSHours; s->mi = GPSMinutes; s->ss = GPSSeconds;
     track_tail = next;
@@ -2650,7 +2661,10 @@ unsigned char InitGSM(void)
             IMEI[i] = pToken[i+1];
         }
         IMEI[15] = '\0';
-        snprintf(ble_device_name, sizeof(ble_device_name), "%s-%.4s", TAG, &IMEI[11]);
+        /* Advertise "V4E-<full IMEI>" as the BLE name: the prefix identifies
+           the device type in a scan list, the IMEI identifies the unit —
+           no serial cable needed. */
+        snprintf(ble_device_name, sizeof(ble_device_name), "V4E-%s", IMEI);
         ble_svc_gap_device_name_set(ble_device_name);
         ble_gap_adv_stop();
         ble_app_advertise();
@@ -4179,20 +4193,16 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         send_lat = last_good_lat;
         send_lon = last_good_lon;
     } else {
-        /* SIM7672G AT+CGPSINFO often returns speed=0 even when moving.
-           Derive speed from consecutive position change so Traccar can detect trips. */
-        if (pPacket->GEvent.Speed == 0.0f && last_good_lat != 0.0f) {
-            float dlat = (send_lat - last_good_lat) * 111.0f;
-            float dlon = (send_lon - last_good_lon) * 86.0f;
-            float dist_km = sqrtf(dlat * dlat + dlon * dlon);
-            float speed_kmh = dist_km * 3600.0f / (float)Params.Fields.PingInterval;
-            if (speed_kmh > 4.0f && speed_kmh < 300.0f)
-                pPacket->GEvent.Speed = speed_kmh;
-        }
         last_good_lat = send_lat;
         last_good_lon = send_lon;
         nvs_save_position();
     }
+    /* Modem CGPSINFO speed is unreliable (0 or a stale value even when moving).
+       Report the 1s track-derived speed when fresh; no recent sample = parked = 0. */
+    pPacket->GEvent.Speed =
+        (track_live_speed_us != 0 &&
+         esp_timer_get_time() - track_live_speed_us <= 10LL * 1000000LL)
+            ? track_live_speed_kmh : 0.0f;
 //    SOS = gpio_get_level(GPIO_SOS);
 //    if(SOS == 0)
 //    {
@@ -4227,8 +4237,10 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     osDelay(1000);
     if(CheckNetwork() == 1)
     {
+        /* No network right now: fail this attempt but KEEP queued packets —
+           the exit path re-queues the event and it is retried next interval.
+           (ForceToSleep() here used to ClearPackets(), silently losing data.) */
         ESP_LOGI(TAG,"Exiting from XHTTP due to no network\n");
-        ForceToSleep();
         goto exit;
     }
     
@@ -4280,11 +4292,14 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     }
     //IWDG_ReloadCounter();
 
-    /* Drain buffered 10s track samples inside this HTTP session — one
+    /* Drain buffered 1s track samples inside this HTTP session — one
        HTTPPARA/HTTPACTION per sample, each with its own timestamp, no
        per-sample session setup. On any failure, remaining samples stay
-       buffered and are retried on the next ping. */
-    while (track_head != track_tail)
+       buffered and are retried on the next ping. Snapshot the tail so
+       samples recorded during the drain go out next cycle (at 1Hz the
+       producer could otherwise keep this loop running indefinitely). */
+    unsigned short drain_end = track_tail;
+    while (track_head != drain_end)
     {
         TrackSample *smp = &track_buf[track_head];
         size_t _ulen = strlen(Params.Fields.HTTPURL);
@@ -4335,14 +4350,15 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         const char *_alarm = (power_alarm == 1) ? "&alarm=powerCut"
                            : (power_alarm == 2) ? "&alarm=powerRestored" : "";
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f&timestamp=%ld&vbat=%f&ncsq=%s&ignition=%s%s&fwver=" FW_VERSION,
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f&timestamp=%ld&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed / 1.852f, // OsmAnd speed param is knots
         osmand_unix_ts(pPacket->GEvent.Year, pPacket->GEvent.Month, pPacket->GEvent.Date,
                        pPacket->GEvent.Hours, pPacket->GEvent.Minutes, pPacket->GEvent.Seconds),
-        pPacket->GEvent.Voltage,
+        ADCBatteryVoltage, // live ADC read — GEvent.Voltage (ChargeVoltageF) is never refreshed
         SignalStrength,
         ign_on ? "true" : "false",
+        (unsigned long)(esp_timer_get_time() / 1000000ULL), // reboots visible server-side
         _alarm);
     }
     Print("AT+HTTPPARA=\"URL\",\"");
@@ -4611,9 +4627,9 @@ exit:
 //            {       break; }
 //        
 //        }
-//        
-//    }    
-    return 0;
+//
+//    }
+    return 1; // failure: caller counts retries and power-cycles the modem after 3
 }
 #endif // SIM7600
 #ifdef SIM7070
@@ -6996,8 +7012,9 @@ ESP_LOGI(TAG,"Entered main task");
             // osDelay(1000);
             if(CheckNetwork() == 1)
             {
-                ESP_LOGI(TAG,"Forcing sleep from 300s main timer due to no network\n");
-                ForceToSleep();
+                /* Log only — ForceToSleep() here cleared the packet queue and
+                   suppressed sends, losing parked data on any network blip. */
+                ESP_LOGI(TAG,"No network at 300s main timer check\n");
             }
             //CheckSignalStrength();
             CheckNetworkLocation();
@@ -7460,12 +7477,17 @@ ESP_LOGI(TAG,"Entered main task");
 //                    #endif
                     
                     //CheckBattery();
-                    
+
 //                    #ifdef BATTERY_PRESENT
 //                    EnableCharger();
 //                    #endif
-                    if((MotionTimer < TIME_TO_SLEEP) || (IsQueueEmpty(RAMQueue)!=0))
-                    {   
+                    /* Always send dequeued events. The old gate
+                       (MotionTimer < TIME_TO_SLEEP || queue non-empty) dropped
+                       every parked-interval ping right after popping it —
+                       total silence while parked. This unit is powered from
+                       the vehicle battery; parked pings must go out too. */
+                    if(1)
+                    {
                         //if(SysClockConfigFlag!='H')
                         {
                             //SystemClock_Config();
@@ -7494,16 +7516,20 @@ ESP_LOGI(TAG,"Entered main task");
                                 ServerRetries++;
                                 if(ServerRetries > 2)
                                 {
-
+                                    /* Modem likely wedged: power-cycle it but
+                                       KEEP queued events and track samples —
+                                       the old path cleared everything and went
+                                       to stop mode, losing all buffered data. */
                                     ServerRetries = 0;
-                                    MotionTimer = TIME_TO_SLEEP+1; //  Make sure no events are in queue to enter sleep
-                                    ClearEventCache();
-                                    while(GetEvent(&GPacket,EVENT_QUEUE) == GET_SUCCESS); // Hopefully doesnt need counter
-                                    MotionTimer=TIME_TO_SLEEP+1;
-                                    goto ENTER_STOP_MODE;
+                                    ESP_LOGW(TAG,"3 consecutive send failures - reinit modem");
+                                    DisableGSM();
+                                    InitGSM();
                                 }
                             }
-                        
+                            else
+                            {
+                                ServerRetries = 0;
+                            }
                         #endif
                         #ifdef SIM7070
                             YHTTP_Request(pFilename,1);
