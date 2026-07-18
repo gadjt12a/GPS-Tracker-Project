@@ -1047,6 +1047,7 @@ void CheckSignalStrength(void)
 float NLat,NLong;
 NetworkLocationStatusType NStatus;
 int NAccuracy;
+char NLRaw[64]; // sanitized raw +CLBS response (nraw= debug attribute)
 char NLPacket[80];
 char TowerPacket[100];
 void CheckNetworkLocation(void)
@@ -1062,9 +1063,22 @@ void CheckNetworkLocation(void)
     //#ifdef SIM800
         osDelay(500);
     //#endif
-    pToken = MapForward(Buff2,70,(char*)"+CLBS:",6);
+    pToken = MapForward(Buff2,BUFF2_SIZE,(char*)"+CLBS:",6);
     if(pToken != NULL)
     {
+        /* Keep a sanitized copy of the raw response line — surfaced as the
+           nraw= debug attribute until the A7672G's field format is confirmed
+           (observed values fit neither the documented lon-first decimal
+           order nor lat-first; see 2.3.25 field data). */
+        int ri;
+        for (ri = 0; ri < (int)sizeof(NLRaw)-1 && pToken[ri]
+                     && pToken[ri] != '\r' && pToken[ri] != '\n'; ri++) {
+            char c = pToken[ri];
+            NLRaw[ri] = ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                         (c >= 'a' && c <= 'z') || c == '.' || c == ',' ||
+                         c == '-') ? c : '_';
+        }
+        NLRaw[ri] = '\0';
         sscanf((void*)pToken,"+CLBS: %d",(int*)&NStatus);
         if(NStatus == NL_SUCCESS)
         {
@@ -4185,7 +4199,13 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
        so they don't pollute the map, but the HTTP response still arrives. */
     bool in_boot_window = (esp_timer_get_time() < 300ULL * 1000000ULL);
     bool live_fix = true; // false = cached/cell position; timestamp omitted so Traccar uses server time
-    bool cell_valid = (NStatus == NL_SUCCESS && NLat != 0.0f && NLong != 0.0f);
+    /* Range-guarded: A7672G CLBS field format is unconfirmed (2.3.25 returned
+       nlat=4254.6 — not a latitude in any documented ordering). Until nraw
+       reveals the real format, out-of-range values are never reported or used. */
+    bool cell_valid = (NStatus == NL_SUCCESS &&
+                       NLat >= -90.0f && NLat <= 90.0f &&
+                       NLong >= -180.0f && NLong <= 180.0f &&
+                       !(NLat == 0.0f && NLong == 0.0f));
     if (send_lat == 0.0f && send_lon == 0.0f) {
         live_fix = false;
         if (last_good_lat != 0.0f) {
@@ -4380,9 +4400,13 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         /* Cell-tower position as extra attributes whenever the modem has one
            (AT+CLBS, refreshed every 300s in the main loop). Doubles as the
            compatibility probe: if this modem rejects CLBS they never appear. */
-        char nl_part[72] = "";
+        char nl_part[160] = "";
         if (cell_valid)
             snprintf(nl_part, sizeof(nl_part), "&nlat=%f&nlon=%f&nacc=%d", NLat, NLong, NAccuracy);
+        if (NLRaw[0]) { /* TEMPORARY: raw +CLBS response for format debugging */
+            size_t _nl = strlen(nl_part);
+            snprintf(nl_part + _nl, sizeof(nl_part) - _nl, "&nraw=%s", NLRaw);
+        }
         snprintf(str, sizeof(str),
             "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
