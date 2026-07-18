@@ -179,10 +179,10 @@ extern const char *TAG;
 
 #define TIME_TO_SLEEP 300
 #define PARK_LONG_SECONDS 172800UL   // 48 hours â€” threshold to enter deep sleep
-#define HEART_BEAT_INTERVAL (8*3600) // 8hr deep-sleep heartbeat wakeup
+#define HEART_BEAT_INTERVAL (2*3600) // 2hr deep-sleep heartbeat wakeup — each wake also delivers queued Traccar commands (~30mAh/day on vehicle battery)
 
 // OTA firmware update
-#define FW_VERSION          "2.3.24"
+#define FW_VERSION          "2.3.25"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096

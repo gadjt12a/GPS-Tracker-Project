@@ -4184,18 +4184,33 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
        Positions with lat=0/lon=0 are filtered server-side by filter.zero=true
        so they don't pollute the map, but the HTTP response still arrives. */
     bool in_boot_window = (esp_timer_get_time() < 300ULL * 1000000ULL);
+    bool live_fix = true; // false = cached/cell position; timestamp omitted so Traccar uses server time
+    bool cell_valid = (NStatus == NL_SUCCESS && NLat != 0.0f && NLong != 0.0f);
     if (send_lat == 0.0f && send_lon == 0.0f) {
-        if (last_good_lat == 0.0f && !in_boot_window)
+        live_fix = false;
+        if (last_good_lat != 0.0f) {
+            send_lat = last_good_lat;
+            send_lon = last_good_lon;
+        } else if (cell_valid) {
+            /* Never had a GPS fix: cell-tower position (~100m-2km) beats nothing. */
+            send_lat = NLat;
+            send_lon = NLong;
+        } else if (!in_boot_window) {
             return 0;
-        send_lat = last_good_lat;
-        send_lon = last_good_lon;
+        }
     } else if (send_lat > -1.0f && send_lat < 1.0f && send_lon > -1.0f && send_lon < 3.0f) {
         /* Fix A: SIM7672G cold-start artifact — GNSS reports a "valid" fix near
            the origin while still acquiring. Treat as no-fix, use cache. */
-        if (last_good_lat == 0.0f && !in_boot_window)
+        live_fix = false;
+        if (last_good_lat != 0.0f) {
+            send_lat = last_good_lat;
+            send_lon = last_good_lon;
+        } else if (cell_valid) {
+            send_lat = NLat;
+            send_lon = NLong;
+        } else if (!in_boot_window) {
             return 0;
-        send_lat = last_good_lat;
-        send_lon = last_good_lon;
+        }
     } else {
         last_good_lat = send_lat;
         last_good_lon = send_lon;
@@ -4353,16 +4368,31 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         const char *_sep = (_ulen > 0 && Params.Fields.HTTPURL[_ulen-1] == '/') ? "" : "/";
         const char *_alarm = (power_alarm == 1) ? "&alarm=powerCut"
                            : (power_alarm == 2) ? "&alarm=powerRestored" : "";
+        /* Timestamp only for a live GPS fix with a sane date. Cached/cell
+           positions previously carried stale (or year-2000) fix times, so
+           Traccar's "latest position" stayed pinned on old data; omitting
+           the param makes the server use receive time. */
+        char ts_part[36] = "";
+        if (live_fix && pPacket->GEvent.Year >= 20)
+            snprintf(ts_part, sizeof(ts_part), "&timestamp=%ld",
+                osmand_unix_ts(pPacket->GEvent.Year, pPacket->GEvent.Month, pPacket->GEvent.Date,
+                               pPacket->GEvent.Hours, pPacket->GEvent.Minutes, pPacket->GEvent.Seconds));
+        /* Cell-tower position as extra attributes whenever the modem has one
+           (AT+CLBS, refreshed every 300s in the main loop). Doubles as the
+           compatibility probe: if this modem rejects CLBS they never appear. */
+        char nl_part[72] = "";
+        if (cell_valid)
+            snprintf(nl_part, sizeof(nl_part), "&nlat=%f&nlon=%f&nacc=%d", NLat, NLong, NAccuracy);
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f&timestamp=%ld&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s&fwver=" FW_VERSION,
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed / 1.852f, // OsmAnd speed param is knots
-        osmand_unix_ts(pPacket->GEvent.Year, pPacket->GEvent.Month, pPacket->GEvent.Date,
-                       pPacket->GEvent.Hours, pPacket->GEvent.Minutes, pPacket->GEvent.Seconds),
+        ts_part,
         ADCBatteryVoltage, // live ADC read — GEvent.Voltage (ChargeVoltageF) is never refreshed
         SignalStrength,
         ign_on ? "true" : "false",
         (unsigned long)(esp_timer_get_time() / 1000000ULL), // reboots visible server-side
+        nl_part,
         _alarm);
     }
     Print("AT+HTTPPARA=\"URL\",\"");
