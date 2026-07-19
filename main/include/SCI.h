@@ -182,7 +182,7 @@ extern const char *TAG;
 #define HEART_BEAT_INTERVAL (2*3600) // 2hr deep-sleep heartbeat wakeup — each wake also delivers queued Traccar commands (~30mAh/day on vehicle battery)
 
 // OTA firmware update
-#define FW_VERSION          "2.3.26"
+#define FW_VERSION          "2.3.27"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096

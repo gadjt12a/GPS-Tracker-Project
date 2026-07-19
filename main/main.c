@@ -1047,8 +1047,19 @@ void CheckSignalStrength(void)
 float NLat,NLong;
 NetworkLocationStatusType NStatus;
 int NAccuracy;
-char NLRaw[64]; // sanitized raw +CLBS response (nraw= debug attribute)
 char NLPacket[80];
+
+/* A7672G +CLBS prints negative coordinates uint32-wrapped (deg*1e6 stored
+   unsigned, then printed /1e6): southern/western hemisphere values come out
+   as true + 2^32/1e6 = true + 4294.967296. Confirmed against 4 field samples
+   2026-07-19, all decode within CLBS's own reported accuracy. Must stay in
+   double until after the subtraction — float32's ~7 significant digits can't
+   hold a wrapped value like 4254.606934. */
+static float clbs_coord(double v, double limit)
+{
+    if (v > limit) v -= 4294.967296; /* 2^32 / 1e6 */
+    return (float)v;
+}
 char TowerPacket[100];
 void CheckNetworkLocation(void)
 {
@@ -1066,25 +1077,15 @@ void CheckNetworkLocation(void)
     pToken = MapForward(Buff2,BUFF2_SIZE,(char*)"+CLBS:",6);
     if(pToken != NULL)
     {
-        /* Keep a sanitized copy of the raw response line — surfaced as the
-           nraw= debug attribute until the A7672G's field format is confirmed
-           (observed values fit neither the documented lon-first decimal
-           order nor lat-first; see 2.3.25 field data). */
-        int ri;
-        for (ri = 0; ri < (int)sizeof(NLRaw)-1 && pToken[ri]
-                     && pToken[ri] != '\r' && pToken[ri] != '\n'; ri++) {
-            char c = pToken[ri];
-            NLRaw[ri] = ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
-                         (c >= 'a' && c <= 'z') || c == '.' || c == ',' ||
-                         c == '-') ? c : '_';
-        }
-        NLRaw[ri] = '\0';
         sscanf((void*)pToken,"+CLBS: %d",(int*)&NStatus);
-        if(NStatus == NL_SUCCESS)
+        if(NStatus == NL_SUCCESS) /* non-zero (e.g. +CLBS: 10) = no coordinates, skip */
         {
+            double dlat = 0, dlon = 0;
             pToken+=6;
             //osDelay(1000);//DelayProc(50000);
-            sscanf((void*)pToken,"%d,%f,%f,%d",(int*)&NStatus,&NLat,&NLong,(int*)&NAccuracy);
+            sscanf((void*)pToken,"%d,%lf,%lf,%d",(int*)&NStatus,&dlat,&dlon,(int*)&NAccuracy);
+            NLat  = clbs_coord(dlat, 90.0);
+            NLong = clbs_coord(dlon, 180.0);
             snprintf((void*)NLPacket,_countof(NLPacket),",\"nlat\":\"%f\",\"nlon\":\"%f\",\"ncsq\":\"%s\"",NLat,NLong,SignalStrength);
             //sprintf((void*)NLPacket,",\"nlat\":\"%f\",\"nlon\":\"%f\",\"ltype\":\"NL\"",NLat,NLong);
         }
@@ -3234,8 +3235,11 @@ void GetNetworkLocation(void)
                 sscanf((void*)pToken,"+CLBS: %d",(int*)&NStatus);
                 if(NStatus == NL_SUCCESS)
                 {
+                    double dlat = 0, dlon = 0;
                     //osDelay(1000);//DelayProc(50000);
-                    sscanf((void*)Buff2,"+CLBS: %d,%f,%f,%d",(int*)&NStatus,&NLat,&NLong,(int*)&NAccuracy);
+                    sscanf((void*)Buff2,"+CLBS: %d,%lf,%lf,%d",(int*)&NStatus,&dlat,&dlon,(int*)&NAccuracy);
+                    NLat  = clbs_coord(dlat, 90.0);
+                    NLong = clbs_coord(dlon, 180.0);
                     sprintf((void*)NLPacket,",\"nlat\":\"%f\",\"nlon\":\"%f\",\"ltype\":\"NL\"",NLat,NLong);
                 }
             }
@@ -4199,9 +4203,9 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
        so they don't pollute the map, but the HTTP response still arrives. */
     bool in_boot_window = (esp_timer_get_time() < 300ULL * 1000000ULL);
     bool live_fix = true; // false = cached/cell position; timestamp omitted so Traccar uses server time
-    /* Range-guarded: A7672G CLBS field format is unconfirmed (2.3.25 returned
-       nlat=4254.6 — not a latitude in any documented ordering). Until nraw
-       reveals the real format, out-of-range values are never reported or used. */
+    /* Range guard kept as defense even though the uint32-wrap decode
+       (clbs_coord) now yields in-range values; also covers the zero-init
+       NStatus == NL_SUCCESS ambiguity via the 0,0 check. */
     bool cell_valid = (NStatus == NL_SUCCESS &&
                        NLat >= -90.0f && NLat <= 90.0f &&
                        NLong >= -180.0f && NLong <= 180.0f &&
@@ -4400,13 +4404,9 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         /* Cell-tower position as extra attributes whenever the modem has one
            (AT+CLBS, refreshed every 300s in the main loop). Doubles as the
            compatibility probe: if this modem rejects CLBS they never appear. */
-        char nl_part[160] = "";
+        char nl_part[80] = "";
         if (cell_valid)
             snprintf(nl_part, sizeof(nl_part), "&nlat=%f&nlon=%f&nacc=%d", NLat, NLong, NAccuracy);
-        if (NLRaw[0]) { /* TEMPORARY: raw +CLBS response for format debugging */
-            size_t _nl = strlen(nl_part);
-            snprintf(nl_part + _nl, sizeof(nl_part) - _nl, "&nraw=%s", NLRaw);
-        }
         snprintf(str, sizeof(str),
             "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
