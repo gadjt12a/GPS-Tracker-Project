@@ -104,7 +104,7 @@ Recommended `traccar.xml` filter settings (note `filter.future` takes **seconds*
 <entry key="filter.duplicate">true</entry>
 <entry key="filter.future">86400</entry>
 <entry key="filter.maxSpeed">300</entry>
-<entry key="filter.distance">40</entry>
+<entry key="filter.distance">5</entry>
 ```
 
 ---
@@ -136,6 +136,7 @@ After the initial flash, subsequent updates are delivered via OTA — no USB acc
 
 | Version | Changes |
 |---|---|
+| **2.3.28** | Harsh driving detection (Phase 7b): 20 Hz LIS3DH sampler task measures horizontal-plane g (mounting-angle agnostic via gravity EWMA). Sustained ≥0.4 g for 300 ms while above 15 km/h → classified by GPS speed trend over 2 s as `hardBraking`, `hardAcceleration`, or `hardCornering`; ≥1.85 g spike = `accident`. 15 s holdoff between alarms. `gmax` attribute reports peak horizontal g per ping for threshold tuning. **Rolled back: `esp_task_wdt_reconfigure()` in `HarshDriveTask` crashes the BLE controller (TWDT panic) when called after the BLE stack is already running. Fix pending in 2.3.29.** |
 | **2.3.27** | Cell-tower positions (`nlat`) are now correct in the southern hemisphere: the A7672G prints negative CLBS coordinates uint32-wrapped (a latitude of −39.63 arrived as 4255.34, i.e. true + 2³²/10⁶), so values out of range are decoded by subtracting 4294.967296 — done in double precision, since float32 can't hold the wrapped 10-digit values. Field-verified on two units: decoded positions land within the modem's own reported accuracy. Temporary `nraw` debug attribute removed. |
 | **2.3.26** | CLBS coordinates range-guarded so unconfirmed values are never reported or used as a position; temporary `nraw` attribute added carrying the sanitized raw `+CLBS` response — the debug data that let 2.3.27 crack the encoding. |
 | **2.3.25** | Positions sent from the cache or cell towers no longer carry a stale/year-2000 `timestamp` — the param is omitted so Traccar uses receive time and the map always shows the device as current. Cell-tower location (`AT+CLBS`, refreshed every 5 min) is reported as `nlat`/`nlon`/`nacc` attributes whenever available, and used as the actual position if the device has never had a GPS fix. Deep-sleep heartbeat shortened 8 hr → 2 hr, so a long-parked vehicle calls home (and picks up queued Traccar commands) every 2 hours. |
