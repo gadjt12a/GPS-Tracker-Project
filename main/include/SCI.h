@@ -194,7 +194,7 @@ extern const char *TAG;
 #define HARSH_MIN_SPEED     15.0f   // ignore events when peak involved speed below this (door slams etc.)
 
 // OTA firmware update
-#define FW_VERSION          "2.3.29"
+#define FW_VERSION          "2.3.30"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096

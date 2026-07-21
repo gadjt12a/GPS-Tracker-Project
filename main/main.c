@@ -7217,13 +7217,23 @@ ESP_LOGI(TAG,"Entered main task");
         {
             SendATCommand("AT\r\n","OK","ERROR",5); // Sleep exit
             osDelay(1000);
-            // SendATCommand("AT+CFUN=1\r\n","OK","ERROR",5); 
+            // SendATCommand("AT+CFUN=1\r\n","OK","ERROR",5);
             // osDelay(1000);
-            if(CheckNetwork() == 1)
             {
-                /* Log only — ForceToSleep() here cleared the packet queue and
-                   suppressed sends, losing parked data on any network blip. */
-                ESP_LOGI(TAG,"No network at 300s main timer check\n");
+                static uint8_t net_fail_count = 0;
+                if(CheckNetwork() == 1)
+                {
+                    ESP_LOGW(TAG,"No network at 300s check (%d/3)", ++net_fail_count);
+                    if(net_fail_count >= 3)
+                    {
+                        ESP_LOGW(TAG,"Network lost 15+ min — restarting");
+                        esp_restart();
+                    }
+                }
+                else
+                {
+                    net_fail_count = 0;
+                }
             }
             //CheckSignalStrength();
             CheckNetworkLocation();
