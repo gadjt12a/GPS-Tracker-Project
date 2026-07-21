@@ -181,8 +181,20 @@ extern const char *TAG;
 #define PARK_LONG_SECONDS 172800UL   // 48 hours â€” threshold to enter deep sleep
 #define HEART_BEAT_INTERVAL (2*3600) // 2hr deep-sleep heartbeat wakeup — each wake also delivers queued Traccar commands (~30mAh/day on vehicle battery)
 
+// Harsh driving detection (Phase 7b) — horizontal-plane g thresholds.
+// 0.4g = industry consensus for fleet products (DOT harsh = 0.45g); tune from
+// the gmax attribute once field data accumulates. Accident capped just under
+// the LIS3DH's ±2g full scale — a real crash clips at 2g in this range.
+#define HARSH_EVENT_G       0.40f   // sustained horizontal accel = harsh event
+#define HARSH_EVENT_MS      300     // must stay above threshold this long
+#define HARSH_RESET_G       0.25f   // re-arm only after accel drops below this
+#define HARSH_ACCIDENT_G    1.85f   // near-clip spike = accident
+#define HARSH_HOLDOFF_S     15      // min gap between harsh alarms
+#define HARSH_SPEED_DELTA   6.0f    // km/h change over 2s that classifies braking/accel vs cornering
+#define HARSH_MIN_SPEED     15.0f   // ignore events when peak involved speed below this (door slams etc.)
+
 // OTA firmware update
-#define FW_VERSION          "2.3.27"
+#define FW_VERSION          "2.3.29"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096

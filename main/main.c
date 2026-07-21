@@ -42,6 +42,7 @@
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 #include "esp_ota_ops.h"
+#include "esp_task_wdt.h"
 #include <math.h>
 extern TaskHandle_t uart_event_task_handle;
 
@@ -555,6 +556,16 @@ static long osmand_unix_ts(int yy, int mo, int dd, int hh, int mi, int ss);
 static int ign_on = 0;        // debounced ignition state
 static int extpwr_on = -1;    // -1 until first debounced reading after boot
 static volatile int power_alarm = 0; // 1=powerCut, 2=powerRestored; cleared after successful send
+
+/* Harsh driving detection (Phase 7b). A 20Hz sampler task measures the
+   acceleration component perpendicular to gravity (mounting-angle agnostic)
+   and classifies sustained events by the GPS speed trend. Same delivery
+   pattern as power_alarm: rides a forced ping, cleared only on success. */
+static volatile int harsh_alarm = 0;        // 1=hardBraking 2=hardAcceleration 3=hardCornering 4=accident
+static int harsh_alarm_in_flight = 0;       // set while a harsh alarm is in the URL being sent
+static volatile float gmax_since_ping = 0;  // peak horizontal g between pings — threshold-tuning attribute
+static int i2c_consecutive_fails = 0;       // bus recovery counter
+
 unsigned short HeartBeatTimer = 0;
 unsigned short NoSignalTimer=0;
 unsigned short ButtonPressTimer=0;
@@ -678,7 +689,7 @@ MotionStatusType INT1;
 #define I2C_MASTER_FREQ_HZ          400000                     /*!< I2C master clock frequency */
 #define I2C_MASTER_TX_BUF_DISABLE   0                          /*!< I2C master doesn't need buffer */
 #define I2C_MASTER_RX_BUF_DISABLE   0                          /*!< I2C master doesn't need buffer */
-#define I2C_MASTER_TIMEOUT_MS       1000
+#define I2C_MASTER_TIMEOUT_MS       50
 
 //#define MPU9250_SENSOR_ADDR                 0x68        /*!< Slave address of the MPU9250 sensor */
 #define ACCLEROMETER_WHO_AM_I_REG_ADDR           0x0F        /*!< Register addresses of the "who am I" register */
@@ -1310,6 +1321,126 @@ static void PowerSenseTick(void)
         force_ping_now = 1;  // report the transition immediately
     }
     extpwr_on = present;
+}
+
+/* Reset the I2C peripheral and re-init the accelerometer after consecutive
+   read failures. The legacy ESP-IDF I2C driver can leave the bus in a stuck
+   state if the slave holds SDA low mid-transaction (e.g. from electrical
+   noise during hard driving). Deleting and reinstalling the driver resets the
+   hardware state machine and releases the GPIO lines. */
+static void accel_i2c_recover(void)
+{
+    ESP_LOGW(TAG, "accel: %d consecutive I2C fails — resetting bus", i2c_consecutive_fails);
+    i2c_driver_delete(I2C_MASTER_NUM);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    i2c_master_init();
+    vTaskDelay(pdMS_TO_TICKS(10));
+    InitAccelerometer_LIS3D();
+    i2c_consecutive_fails = 0;
+}
+
+/* Read one LIS3DH XYZ sample. HR mode ±2g: 12-bit left-justified, 1mg/LSB.
+   0x80 on the register address enables auto-increment for the 6-byte burst.
+   Returns 1 on success, 0 on failure (triggers bus recovery after 20 misses). */
+static int accel_read_xyz(float *ax, float *ay, float *az)
+{
+    uint8_t d[6];
+    if (motion_sensor_register_read(0x28 | 0x80, d, 6) != ESP_OK) {
+        if (++i2c_consecutive_fails >= 20)
+            accel_i2c_recover();
+        return 0;
+    }
+    i2c_consecutive_fails = 0;
+    *ax = (float)((int16_t)((d[1] << 8) | d[0]) >> 4) * 0.001f;
+    *ay = (float)((int16_t)((d[3] << 8) | d[2]) >> 4) * 0.001f;
+    *az = (float)((int16_t)((d[5] << 8) | d[4]) >> 4) * 0.001f;
+    return 1;
+}
+
+static void HarshDriveTask(void *arg)
+{
+    esp_task_wdt_add(NULL);   // register so a stuck I2C shows this task in TWDT output, not IDLE
+
+    const int PERIOD_MS = 50;                       // 20Hz
+    const int OVER_SAMPLES = HARSH_EVENT_MS / PERIOD_MS;
+    float gx = 0, gy = 0, gz = 0;                  // gravity estimate (EWMA, tau ~25s)
+    int seed = 40;                                  // fast-settle window after boot
+    int over = 0, accident_over = 0, latched = 0;
+    int64_t last_alarm_us = 0;
+    float spd_hist[4] = {0};                        // 500ms steps — [0]=now-2s
+    int tick = 0;
+    TickType_t wake = xTaskGetTickCount();
+
+    for (;;) {
+        vTaskDelayUntil(&wake, pdMS_TO_TICKS(PERIOD_MS));
+        esp_task_wdt_reset();
+
+        float ax, ay, az;
+        if (!accel_read_xyz(&ax, &ay, &az))
+            continue;
+
+        float alpha = seed ? 0.05f : 0.002f;
+        if (seed) seed--;
+        gx += alpha * (ax - gx);
+        gy += alpha * (ay - gy);
+        gz += alpha * (az - gz);
+        float gmag2 = gx * gx + gy * gy + gz * gz;
+        if (gmag2 < 0.25f) continue;               // gravity estimate not settled/sane
+
+        /* Linear accel minus its component along gravity = horizontal plane. */
+        float lx = ax - gx, ly = ay - gy, lz = az - gz;
+        float dot = (lx * gx + ly * gy + lz * gz) / gmag2;
+        float hx = lx - dot * gx, hy = ly - dot * gy, hz = lz - dot * gz;
+        float hmag = sqrtf(hx * hx + hy * hy + hz * hz);
+
+        if (hmag > gmax_since_ping) gmax_since_ping = hmag;
+
+        /* 500ms speed history for braking/acceleration/cornering classification. */
+        float spd_now = (track_live_speed_us != 0 &&
+                         esp_timer_get_time() - track_live_speed_us <= 10LL * 1000000LL)
+                            ? track_live_speed_kmh : 0.0f;
+        if (++tick >= 10) {
+            tick = 0;
+            spd_hist[0] = spd_hist[1]; spd_hist[1] = spd_hist[2];
+            spd_hist[2] = spd_hist[3]; spd_hist[3] = spd_now;
+        }
+
+        int moving = (MotionTimer <= 60) && (track_live_speed_us != 0 &&
+                      esp_timer_get_time() - track_live_speed_us <= 10LL * 1000000LL);
+        int64_t now = esp_timer_get_time();
+        int holdoff_ok = (now - last_alarm_us) > (int64_t)HARSH_HOLDOFF_S * 1000000LL;
+
+        if (latched) {                              // one alarm per excursion
+            if (hmag < HARSH_RESET_G) latched = 0;
+            continue;
+        }
+
+        /* Accident: near-clip spike, 2 consecutive samples. Checked first so a
+           crash isn't reported as mere hard braking. */
+        accident_over = (hmag >= HARSH_ACCIDENT_G) ? accident_over + 1 : 0;
+        if (accident_over >= 2 && moving && holdoff_ok) {
+            harsh_alarm = 4;
+            force_ping_now = 1;
+            last_alarm_us = now;
+            latched = 1;
+            ESP_LOGW(TAG, "HARSH: accident %.2fg", hmag);
+            continue;
+        }
+
+        over = (hmag >= HARSH_EVENT_G) ? over + 1 : 0;
+        if (over >= OVER_SAMPLES && moving && holdoff_ok) {
+            float ds = spd_now - spd_hist[0];      // km/h change over ~2s
+            float peak_spd = (spd_now > spd_hist[0]) ? spd_now : spd_hist[0];
+            if (peak_spd >= HARSH_MIN_SPEED && harsh_alarm == 0) {
+                harsh_alarm = (ds <= -HARSH_SPEED_DELTA) ? 1
+                            : (ds >=  HARSH_SPEED_DELTA) ? 2 : 3;
+                force_ping_now = 1;
+                last_alarm_us = now;
+                ESP_LOGW(TAG, "HARSH: type=%d %.2fg ds=%.1fkm/h", harsh_alarm, hmag, ds);
+            }
+            latched = 1;
+        }
+    }
 }
 
 void PostMotionEvent(void)
@@ -4390,8 +4521,23 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     {
         size_t _ulen = strlen(Params.Fields.HTTPURL);
         const char *_sep = (_ulen > 0 && Params.Fields.HTTPURL[_ulen-1] == '/') ? "" : "/";
-        const char *_alarm = (power_alarm == 1) ? "&alarm=powerCut"
-                           : (power_alarm == 2) ? "&alarm=powerRestored" : "";
+        /* One alarm per ping; accident outranks power, power outranks other
+           harsh events (rare collision — the loser stays pending and rides
+           the next ping). harsh_alarm_in_flight tells SUCCESS which to clear. */
+        const char *_alarm;
+        harsh_alarm_in_flight = 0;
+        if (harsh_alarm == 4)      { _alarm = "&alarm=accident";         harsh_alarm_in_flight = 1; }
+        else if (power_alarm == 1) { _alarm = "&alarm=powerCut"; }
+        else if (power_alarm == 2) { _alarm = "&alarm=powerRestored"; }
+        else if (harsh_alarm == 1) { _alarm = "&alarm=hardBraking";      harsh_alarm_in_flight = 1; }
+        else if (harsh_alarm == 2) { _alarm = "&alarm=hardAcceleration"; harsh_alarm_in_flight = 1; }
+        else if (harsh_alarm == 3) { _alarm = "&alarm=hardCornering";    harsh_alarm_in_flight = 1; }
+        else                       { _alarm = ""; }
+        /* Peak horizontal g since last ping — field data for tuning HARSH_EVENT_G.
+           Suppressed when negligible to keep parked pings clean. */
+        char g_part[20] = "";
+        if (gmax_since_ping >= 0.05f)
+            snprintf(g_part, sizeof(g_part), "&gmax=%.2f", gmax_since_ping);
         /* Timestamp only for a live GPS fix with a sane date. Cached/cell
            positions previously carried stale (or year-2000) fix times, so
            Traccar's "latest position" stayed pinned on old data; omitting
@@ -4408,7 +4554,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         if (cell_valid)
             snprintf(nl_part, sizeof(nl_part), "&nlat=%f&nlon=%f&nacc=%d", NLat, NLong, NAccuracy);
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s&fwver=" FW_VERSION,
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed / 1.852f, // OsmAnd speed param is knots
         ts_part,
@@ -4417,6 +4563,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         ign_on ? "true" : "false",
         (unsigned long)(esp_timer_get_time() / 1000000ULL), // reboots visible server-side
         nl_part,
+        g_part,
         _alarm);
     }
     Print("AT+HTTPPARA=\"URL\",\"");
@@ -4616,7 +4763,11 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     //free(string);
 SUCCESS:
     esp_ota_mark_app_valid_cancel_rollback();
-    power_alarm = 0; // alarm delivered; a failed send keeps it for the retry
+    /* Clear only the alarm source that was in this ping's URL; a pending alarm
+       from the other source rides the next ping. Failed sends keep both. */
+    if (harsh_alarm_in_flight) { harsh_alarm = 0; harsh_alarm_in_flight = 0; }
+    else                       { power_alarm = 0; }
+    gmax_since_ping = 0; // peak reported; restart measurement window
     ClearEventCache();
     if(RFIDDataPresent==1)
     {
@@ -8095,8 +8246,9 @@ void app_main(void)
     // EnterDeepSleep();
     //ESP_LOGI(TAG,"Before tasks");
     xTaskCreate(ADCTask, "ADCTask", 2048, NULL, 10, NULL);
-    xTaskCreate(StartTimerTask, "StartTimerTask", 4096, NULL, 10, NULL);   
+    xTaskCreate(StartTimerTask, "StartTimerTask", 4096, NULL, 10, NULL);
     xTaskCreate(StartMainTask, "StartMainTask", 8192, NULL, 10, NULL); //TIMER_TASK_STACK_SIZE
+    xTaskCreate(HarshDriveTask, "HarshDrive", 3072, NULL, 5, NULL); // 20Hz accel sampler (Phase 7b)
     
     
     
