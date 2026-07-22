@@ -955,18 +955,20 @@ unsigned char SendATCommand(char *pCommand,char *pResponse1,char *pResponse2, un
     ResetBuffer();
     Print(pCommand);
     LoopTimeout1 = 0;
-    while(1)
     {
-        vTaskDelay(1);
-        if(MapForward(Buff2,BUFF2_SIZE,(char*)pResponse1,Response1Length) != NULL)
-            return 1;
-        if(MapForward(Buff2,BUFF2_SIZE,(char*)pResponse2,Response2Length) != NULL)
-            return 2;
-        if(LoopTimeout1>Timeout)
-            return 3; 
-        
+        TickType_t _deadline = xTaskGetTickCount() + pdMS_TO_TICKS((uint32_t)Timeout * 1000);
+        while(1)
+        {
+            vTaskDelay(1);
+            if(MapForward(Buff2,BUFF2_SIZE,(char*)pResponse1,Response1Length) != NULL)
+                return 1;
+            if(MapForward(Buff2,BUFF2_SIZE,(char*)pResponse2,Response2Length) != NULL)
+                return 2;
+            if(xTaskGetTickCount() >= _deadline)
+                return 3;
+        }
     }
-    
+
 }
 void ForceToSleep(void)
 {
@@ -4304,6 +4306,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     //unsigned char retries,i;
     HWEventDataType *pPacket;
     char *pToken;
+    TickType_t _dl;
     //unsigned char CheckSum,cs[2];
     pPacket = &GPacket;
     //retries = 0; 
@@ -4386,26 +4389,26 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     ////IWDG_ReloadCounter();
     ResetBuffer();
     //Print( "AAAAAAAAAAAAAT\r\n");
-    Print( "AT\r\n");    
-    LoopTimeout1 = 0;
+    Print( "AT\r\n");
+    LoopTimeout1 = 0; _dl = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
     while(1)
     {
         if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL)
                 break;
-        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
+        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (xTaskGetTickCount() >= _dl))
         {       goto exit; }
-        
+
     }
     ResetBuffer();
-    Print( "AT+CSCLK=0\r\n");    
-    LoopTimeout1 = 0;
+    Print( "AT+CSCLK=0\r\n");
+    LoopTimeout1 = 0; _dl = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
     while(1)
     {
         if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL)
                 break;
-        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
+        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (xTaskGetTickCount() >= _dl))
         {       goto exit; }
-        
+
     }
     // SendATCommand("AT+CFUN=1\r\n","OK","ERROR",5); // Sleep exit
     osDelay(1000);
@@ -4431,38 +4434,38 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
        subsequent HTTPACTION fires all of them, causing a request storm. */
     ResetBuffer();
     Print("AT+HTTPTERM\r\n");
-    LoopTimeout1 = 0;
+    LoopTimeout1 = 0; _dl = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
     while(1)
     {
         if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL) break;
-        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>5)) break;
+        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (xTaskGetTickCount() >= _dl)) break;
     }
     ResetBuffer();
     Print("AT+HTTPINIT\r\n");
-    LoopTimeout1 = 0;
+    LoopTimeout1 = 0; _dl = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
     while(1)
     {
-        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
+        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (xTaskGetTickCount() >= _dl))
         {
             ResetBuffer();
-          
+
             break;
         }
         if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL)
         {       break; }
-        
+
     }
-    
+
     ResetBuffer();
     Print("AT+HTTPPARA=\"CID\",1\r\n");
-    LoopTimeout1 = 0;
+    LoopTimeout1 = 0; _dl = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
     while(1)
     {
         if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL)
                 break;
-        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
+        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (xTaskGetTickCount() >= _dl))
         {      break; }
-        
+
     }
     //IWDG_ReloadCounter();
 
@@ -4487,20 +4490,20 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         Print("AT+HTTPPARA=\"URL\",\"");
         Print(str);
         Print("\"\r\n");
-        LoopTimeout1 = 0;
+        LoopTimeout1 = 0; _dl = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
         while(1)
         {
             if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL) break;
-            if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
+            if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (xTaskGetTickCount() >= _dl))
             {   goto exit; }
         }
         ResetBuffer();
         Print("AT+HTTPACTION=0\r\n");
-        LoopTimeout1 = 0;
+        LoopTimeout1 = 0; _dl = xTaskGetTickCount() + pdMS_TO_TICKS(60000);
         while(1)
         {
             if(MapForward(Buff2,BUFF2_SIZE,(char*)"ACTION:",7) != NULL) break;
-            if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>60))
+            if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (xTaskGetTickCount() >= _dl))
             {   goto exit; }
         }
         osDelay(300); // let the rest of the +HTTPACTION: 0,<code>,<size> URC arrive
@@ -4569,30 +4572,30 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     Print("AT+HTTPPARA=\"URL\",\"");
     Print(str);
     Print("\"\r\n");
-    LoopTimeout1 = 0;
+    LoopTimeout1 = 0; _dl = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
     while(1)
     {
         if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL)
                 break;
-        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
+        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (xTaskGetTickCount() >= _dl))
         {       break; }
 
     }
-    
+
 
     ////IWDG_ReloadCounter();
     ResetBuffer();
     Print("AT+HTTPACTION=0\r\n");
-    LoopTimeout1 = 0;
+    LoopTimeout1 = 0; _dl = xTaskGetTickCount() + pdMS_TO_TICKS(60000);
     while(1)
     {
         if(MapForward(Buff2,BUFF2_SIZE,(char*)"ACTION:",7) != NULL)
                 break;
-        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>60))
-        {       
-            goto exit; 
+        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (xTaskGetTickCount() >= _dl))
+        {
+            goto exit;
         }
-       
+
     }
     if(Version[0]!=0)
     {
@@ -4625,7 +4628,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
     //Print("AT+HTTPREAD=0,50\r\n");
     //DelayProc(850000);
     osDelay(500);
-    LoopTimeout1 = 0;
+    LoopTimeout1 = 0; _dl = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
     while(1)
     {
         // #ifdef SHEETS_ENABLED
@@ -4741,15 +4744,15 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         
             break;
         }
-        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
+        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (xTaskGetTickCount() >= _dl))
         {       goto exit; }
         if((MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL))
-        { 
+        {
                 break;
         }
 //        goto exit; }
-  
-        
+
+
     }
     
       
@@ -4778,15 +4781,15 @@ SUCCESS:
     }
     ResetBuffer();
     Print("AT+HTTPTERM\r\n");
-    LoopTimeout1 = 0;
+    LoopTimeout1 = 0; _dl = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
     while(1)
     {
         if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL)
                 break;
-        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
+        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (xTaskGetTickCount() >= _dl))
         {       break; }
-        
-    }       
+
+    }
     // SendATCommand("AT+CFUN=0\r\n","OK","ERROR",5);
     // Modem stays at CSCLK=0 so XCheckGPS GPS reads succeed in the main loop
 
@@ -4796,12 +4799,12 @@ SUCCESS:
 exit:
     ResetBuffer();
     Print("AT+HTTPTERM\r\n");
-    LoopTimeout1 = 0;
+    LoopTimeout1 = 0; _dl = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
     while(1)
     {
         if(MapForward(Buff2,BUFF2_SIZE,(char*)"OK",2) != NULL)
                 break;
-        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (LoopTimeout1>30))
+        if((MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL) || (xTaskGetTickCount() >= _dl))
         {       break; }
 
     }
