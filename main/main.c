@@ -1325,6 +1325,7 @@ static void PowerSenseTick(void)
     extpwr_on = present;
 }
 
+#ifdef ENABLE_HARSH_DRIVING
 /* Reset the I2C peripheral and re-init the accelerometer after consecutive
    read failures. The legacy ESP-IDF I2C driver can leave the bus in a stuck
    state if the slave holds SDA low mid-transaction (e.g. from electrical
@@ -1444,6 +1445,7 @@ static void HarshDriveTask(void *arg)
         }
     }
 }
+#endif // ENABLE_HARSH_DRIVING
 
 void PostMotionEvent(void)
 {
@@ -8261,7 +8263,9 @@ void app_main(void)
     xTaskCreate(ADCTask, "ADCTask", 2048, NULL, 10, NULL);
     xTaskCreate(StartTimerTask, "StartTimerTask", 4096, NULL, 10, NULL);
     xTaskCreate(StartMainTask, "StartMainTask", 8192, NULL, 10, NULL); //TIMER_TASK_STACK_SIZE
+#ifdef ENABLE_HARSH_DRIVING
     xTaskCreate(HarshDriveTask, "HarshDrive", 3072, NULL, 5, NULL); // 20Hz accel sampler (Phase 7b)
+#endif
     
     
     

@@ -185,6 +185,14 @@ extern const char *TAG;
 // 0.4g = industry consensus for fleet products (DOT harsh = 0.45g); tune from
 // the gmax attribute once field data accumulates. Accident capped just under
 // the LIS3DH's ±2g full scale — a real crash clips at 2g in this range.
+//
+// DISABLED since 2.3.32: every build with HarshDriveTask running (2.3.28-2.3.31)
+// wedged within hours — BLE btController livelocks at high priority and starves
+// all other tasks (incl. main task = no pings). Trigger mechanism unproven;
+// suspects are heap churn from the I2C driver delete/reinstall recovery path or
+// HarshDriveTask stack overflow trampling BLE heap. Re-enable only with the
+// 2.3.33 hardening plan (see phases roadmap / CLAUDE.md).
+// #define ENABLE_HARSH_DRIVING
 #define HARSH_EVENT_G       0.40f   // sustained horizontal accel = harsh event
 #define HARSH_EVENT_MS      300     // must stay above threshold this long
 #define HARSH_RESET_G       0.25f   // re-arm only after accel drops below this
@@ -194,7 +202,7 @@ extern const char *TAG;
 #define HARSH_MIN_SPEED     15.0f   // ignore events when peak involved speed below this (door slams etc.)
 
 // OTA firmware update
-#define FW_VERSION          "2.3.31"
+#define FW_VERSION          "2.3.32"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096
