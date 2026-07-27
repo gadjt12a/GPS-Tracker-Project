@@ -161,6 +161,13 @@ while PlatformIO ships **1.9.0**. The script deliberately puts only the 1.12.1 d
 `PATH`, matching cmake and the hash seed documented for `rebuild_ninja_log.py`. Do not add
 PlatformIO's `tool-ninja`.
 
+**Do not run `publish.ps1` with `2>&1`.** The script sets `$ErrorActionPreference = "Stop"`,
+and in PowerShell 5.1 redirecting a native command's stderr wraps each line in an
+ErrorRecord, turning harmless output into a terminating error. ESP-IDF's version detection
+prints `fatal: not a git repository` to stderr during cmake regeneration (it probes
+`IDF_PATH`, which PlatformIO ships as a tarball rather than a git checkout). Harmless
+unredirected; fatal under `2>&1`. Cost 15 minutes chasing a non-bug on 2026-07-28.
+
 **Original defect:**
 
 Committing changes `git describe`, which trips ESP-IDF's `RERUN_CMAKE` rule. `publish.ps1`
