@@ -108,8 +108,35 @@ lacks `-mtune=esp-base`. Fix documented in CLAUDE.md.
 
 ## C. Defects found in review 2026-07-28
 
+### C10 — Release tooling is not under version control
+**P2 · OPEN**
+
+Only `VALTRACK-V4-ESP32-C3/` is a git repository. The project root is not, so
+`ota-server/publish.ps1`, `ota-server/`, `scripts/rebuild_ninja_log.py` and `CLAUDE.md`
+have no history, no backup and no way to recover a bad edit.
+
+That is uncomfortable for `publish.ps1` in particular: it is the only thing that can push
+firmware to live vehicles, and it has a documented encoding hazard (PowerShell 5.1 reads
+UTF-8 without BOM as Windows-1252, so a stray em dash silently breaks parsing). A corrupted
+copy today is unrecoverable.
+
+**Fix:** `git init` at the project root, or move `ota-server/` and `scripts/` into the
+firmware repo. Either gives the release path a history.
+
 ### C1 — `publish.ps1` never commits, so tags point at the previous version
-**P1 · OPEN**
+**P1 · FIXED 2026-07-28 (pending a live release)**
+
+**Fix applied:** two guards.
+1. Preflight aborts if `git status --porcelain --untracked-files=no` is non-empty, before
+   anything is built or written.
+2. After the FW_VERSION bump, aborts if that bump actually changed `SCI.h` (meaning the
+   version was never committed), printing the exact commit command and leaving the bump on
+   disk so the user only has to commit and re-run.
+
+Together these make it impossible to tag a commit that is not what was built. Both paths
+tested 2026-07-28: dirty tree aborts, uncommitted version aborts, neither uploads anything.
+
+**Original defect:**
 
 Step 8 (publish.ps1:174-188) tags whatever `HEAD` is and pushes. With a dirty tree it
 silently tags the *previous* release's commit. Hit for real today: `v2.3.33` initially
@@ -123,7 +150,18 @@ CLAUDE.md assumes `git checkout vX.Y.Z` restores matching source.
 failing loudly is safer than committing on the user's behalf.
 
 ### C9 — `publish.ps1` cannot build after a git commit
-**P1 · OPEN**
+**P1 · FIXED 2026-07-28**
+
+**Fix applied:** `publish.ps1` now sets `IDF_PATH`, `ESP_ROM_ELF_DIR` and prepends the
+PlatformIO toolchain, the Espressif ninja directory and the ESP-IDF python directory to
+`PATH` before invoking ninja, so the cmake regeneration succeeds unattended.
+
+Note on ninja: `CMAKE_MAKE_PROGRAM` in `CMakeCache.txt` is the Espressif ninja **1.12.1**,
+while PlatformIO ships **1.9.0**. The script deliberately puts only the 1.12.1 directory on
+`PATH`, matching cmake and the hash seed documented for `rebuild_ninja_log.py`. Do not add
+PlatformIO's `tool-ninja`.
+
+**Original defect:**
 
 Committing changes `git describe`, which trips ESP-IDF's `RERUN_CMAKE` rule. `publish.ps1`
 then invokes bare `ninja` (publish.ps1:115) with no ESP-IDF environment, so the cmake
