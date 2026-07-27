@@ -541,6 +541,7 @@ static int64_t last_fix_us = 0;         // esp_timer time of the last valid GPS 
 static int64_t gnss_last_action_us = 0; // boot / last fix / last recovery attempt — escalation window start
 static int    gnss_recover_stage = 0;   // 0=none, 1=power-cycled, 2=cold-start, 3=modem reinit
 static uint32_t gnss_recover_count = 0; // recovery attempts since boot — reported as gpsrec
+static int    gnss_backoff_mult = 1;    // window multiplier, doubles per failed recovery, reset on fix
 
 /* A cached position older than this is worse than the cell-tower fix, which is
    ~550m but current. Below it, the last GPS fix still wins. */
@@ -558,6 +559,7 @@ static uint32_t gnss_recover_count = 0; // recovery attempts since boot — repo
    tight enough to catch a real wedge quickly. */
 #define GNSS_RECOVER_AFTER_S    600   /* warm — had a fix this session */
 #define GNSS_COLDSTART_GRACE_S 1800   /* cold — no fix yet this session (TTFF ~10min observed) */
+#define GNSS_BACKOFF_MAX          8   /* window multiplier ceiling: 600s*8 = 80min between attempts */
 
 /* 1-second GPS track buffer. Samples recorded while moving; drained as a
    batch inside the ping HTTP session so track resolution is 1s while the
@@ -5494,6 +5496,12 @@ static void GNSSRecover(void)
             gnss_recover_stage = 0;
             break;
     }
+    /* Back off geometrically so a receiver that is genuinely dead (or a vehicle
+       driven all day under heavy tree cover) is not power-cycled every 10
+       minutes indefinitely. Reset to 1 on the next successful fix. */
+    if (gnss_backoff_mult < GNSS_BACKOFF_MAX)
+        gnss_backoff_mult *= 2;
+
     /* Restart the window again on exit: stage 3 can spend a minute inside
        InitGSM, and TTFF must be measured from when that finished, not from
        when recovery began. */
@@ -5565,12 +5573,29 @@ void XCheckGPS(void)
             GPSDay = GPSMonth = GPSYear = 0;
             GPSHours = GPSMinutes = GPSSeconds = 0;
 
-            /* Escalate GNSS recovery once the no-fix window elapses. The window
-               is the generous cold-start grace until this session's first fix,
-               then tightens — see the GNSS_*_S comments. */
+            /* Escalate GNSS recovery once the no-fix window elapses — but only
+               while the vehicle is actually active (ignition on, or physical
+               motion within the last 60s).
+
+               A parked vehicle with no fix is usually parked somewhere with no
+               sky view (carport, garage), not carrying a wedged receiver, and
+               recovery cannot help: stage 3 power-cycles the whole modem, which
+               costs battery and a fresh LTE registration for nothing. Field data
+               from the van, night of 2026-07-27, drove this change: 19 recovery
+               attempts over 3.3h — roughly 6 full modem reinits — every one of
+               them with ignition=false and none of which could have worked.
+
+               While parked the window is held open (anchored to now) rather than
+               left to expire. That way the grace period starts fresh the moment
+               the vehicle moves off, instead of firing a power-cycle instantly at
+               ignition-on and restarting time-to-first-fix just as the receiver
+               finally gets a clear view of the sky. */
+            bool gnss_active = ign_on || (MotionTimer <= 60);
             int64_t window_s = (last_fix_us != 0)
                 ? GNSS_RECOVER_AFTER_S : GNSS_COLDSTART_GRACE_S;
-            if (gnss_last_action_us == 0)
+            window_s *= gnss_backoff_mult;
+
+            if (gnss_last_action_us == 0 || !gnss_active)
                 gnss_last_action_us = esp_timer_get_time();
             else if (esp_timer_get_time() - gnss_last_action_us >
                      window_s * 1000000LL)
@@ -5612,10 +5637,12 @@ void XCheckGPS(void)
             pfLat = fLat;
             pfLong = fLong;
             /* Valid fix: reset the recovery ladder and restart the no-fix window
-               so a later failure starts again at the cheapest stage. */
+               so a later failure starts again at the cheapest stage, at the
+               full cadence rather than a backed-off one. */
             last_fix_us = esp_timer_get_time();
             gnss_last_action_us = last_fix_us;
             gnss_recover_stage = 0;
+            gnss_backoff_mult = 1;
         }
         if(GPSStatus != prevGPSStatus)
         {
