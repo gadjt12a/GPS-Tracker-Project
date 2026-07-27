@@ -133,7 +133,16 @@ lacks `-mtune=esp-base`. Fix documented in CLAUDE.md.
 ## C. Defects found in review 2026-07-28
 
 ### C10 — Release tooling is not under version control
-**P2 · OPEN**
+**P2 · FIXED 2026-07-28**
+
+`git init` at the project root. Tracks `CLAUDE.md`, `ota-server/publish.ps1`,
+`docker-compose.yml`, `nginx.conf`, `zimaboard-setup.sh` and the sync-docs skill. Excludes
+the firmware repo (own remote), built `.bin` files and machine-local Claude permissions.
+`.gitattributes` pins LF on files that execute on the Zimaboard, since a CRLF
+`zimaboard-setup.sh` would fail with "bad interpreter". No remote configured yet - local
+history only.
+
+**Original defect:**
 
 Only `VALTRACK-V4-ESP32-C3/` is a git repository. The project root is not, so
 `ota-server/publish.ps1`, `ota-server/`, `scripts/rebuild_ninja_log.py` and `CLAUDE.md`
