@@ -122,6 +122,32 @@ CLAUDE.md assumes `git checkout vX.Y.Z` restores matching source.
 **Fix:** make `publish.ps1` abort on a dirty working tree. Preferred over auto-committing —
 failing loudly is safer than committing on the user's behalf.
 
+### C9 — `publish.ps1` cannot build after a git commit
+**P1 · OPEN**
+
+Committing changes `git describe`, which trips ESP-IDF's `RERUN_CMAKE` rule. `publish.ps1`
+then invokes bare `ninja` (publish.ps1:115) with no ESP-IDF environment, so the cmake
+regeneration fails:
+
+```
+OSError: ESP_ROM_ELF_DIR environment variable is not defined.
+CMake Error at CMakeLists.txt:5 (include)
+```
+
+This bites on **every** release, because C1's fix (commit before publishing) guarantees a
+fresh commit immediately before the build. Hit twice on 2026-07-28.
+
+**Workaround used:** run `ninja` manually first with `IDF_PATH`, `ESP_ROM_ELF_DIR` and the
+PlatformIO toolchain/ninja/python on `PATH`, letting cmake regenerate; then `publish.ps1`'s
+ninja call is a no-op and succeeds.
+
+**Fix:** set those three variables inside `publish.ps1` before invoking ninja.
+
+Related, seen twice and self-resolving on retry: `ninja: error: failed recompaction:
+Permission denied` on `.ninja_log` during regeneration. Probably an AV or file-handle race.
+A retry cleared it both times, but if it ever sticks, `.ninja_log` is the one file that must
+not be lost (see K3).
+
 ### C2 — Out-of-bounds read in the UART receive path
 **P2 · OPEN**
 
