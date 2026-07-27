@@ -77,7 +77,31 @@ moment Valetron ships a modem update.
 ## B. Known / previously documented
 
 ### K1 — btController livelock with `HarshDriveTask`
-**P1 · OPEN (mitigated)**
+**P1 · HARDENED in 2.3.35, awaiting field proof**
+
+**Hardening applied (2.3.35), harsh driving re-enabled:**
+- Stack 3072 -> 4096 (suspect: overflow trampling adjacent BLE heap)
+- All `ESP_LOGW`/printf removed from the 20Hz loop (stack-hungry float
+  formatting, and takes the stdout lock while the BLE host runs)
+- I2C recovery rewritten: SCL clock-pulse bus clear + `i2c_param_config()`
+  instead of `i2c_driver_delete()`/`i2c_master_init()`/`InitAccelerometer_LIS3D()`.
+  No heap churn, no interrupt re-registration next to BLE allocations.
+- **New finding:** the accel burst read used the general 1000ms I2C timeout while
+  TWDT is 5s with panic enabled, and recovery only triggered after 20 consecutive
+  failures. A genuinely stuck bus would therefore panic-reboot at ~5s, long before
+  recovery was ever attempted - the recovery path could never run in the exact
+  situation it existed for. Now a dedicated 100ms timeout
+  (`I2C_ACCEL_TIMEOUT_MS`) with a 5-failure threshold: 500ms worst case, well
+  inside the watchdog.
+- Instrumentation on every ping: `hmin` (min free heap since boot), `hstk`
+  (HarshDriveTask stack bytes remaining), `i2crec` (bus clears since boot)
+
+**Confirm by:** `hstk` should stay comfortably above 0 and flat; `hmin` should not
+slide downward over hours; `i2crec` should stay 0 or near it. A wedge now
+panic-reboots (uptime resets), and the last ping before it says which suspect was
+real.
+
+**Original defect:**
 
 Every build carrying `HarshDriveTask` (2.3.28–2.3.31) wedged within hours, including
 stationary on the bench. TWDT capture showed `CPU 0: btController` starving all other

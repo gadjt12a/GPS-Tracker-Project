@@ -43,6 +43,7 @@
 #include "driver/rtc_io.h"
 #include "esp_ota_ops.h"
 #include "esp_task_wdt.h"
+#include "esp_rom_sys.h"   // esp_rom_delay_us for the I2C bus-clear pulse train
 #include <math.h>
 extern TaskHandle_t uart_event_task_handle;
 
@@ -596,6 +597,17 @@ static volatile int harsh_alarm = 0;        // 1=hardBraking 2=hardAcceleration 
 static int harsh_alarm_in_flight = 0;       // set while a harsh alarm is in the URL being sent
 static volatile float gmax_since_ping = 0;  // peak horizontal g between pings — threshold-tuning attribute
 static int i2c_consecutive_fails = 0;       // bus recovery counter
+static volatile uint32_t i2c_recover_count = 0; // bus clears since boot — reported as i2crec
+static TaskHandle_t harsh_task_handle = NULL;   // for stack high-water instrumentation
+
+/* Dedicated timeout for the 20Hz sampler's burst read, separate from the 1000ms
+   general I2C timeout used for EEPROM and config writes.
+   CONFIG_ESP_TASK_WDT_TIMEOUT_S is 5 with PANIC enabled, so at 1000ms per read
+   five consecutive stuck reads would panic-reboot the device — and the old code
+   only attempted recovery after 20 failures, i.e. it could never recover before
+   the reboot. 100ms x 5 failures = 500ms, comfortably inside the watchdog. */
+#define I2C_ACCEL_TIMEOUT_MS    100
+#define ACCEL_FAILS_BEFORE_CLEAR  5
 
 unsigned short HeartBeatTimer = 0;
 unsigned short NoSignalTimer=0;
@@ -1361,30 +1373,76 @@ static void PowerSenseTick(void)
 }
 
 #ifdef ENABLE_HARSH_DRIVING
-/* Reset the I2C peripheral and re-init the accelerometer after consecutive
-   read failures. The legacy ESP-IDF I2C driver can leave the bus in a stuck
-   state if the slave holds SDA low mid-transaction (e.g. from electrical
-   noise during hard driving). Deleting and reinstalling the driver resets the
-   hardware state machine and releases the GPIO lines. */
+/* Recover a stuck I2C bus by clocking it free, rather than tearing the driver
+   down and rebuilding it.
+
+   The previous implementation called i2c_driver_delete() + i2c_master_init() +
+   InitAccelerometer_LIS3D(). That frees and reallocates driver structures and
+   re-registers an interrupt, and doing so repeatedly alongside the BLE
+   controller's own allocations is one of the two suspects behind the
+   btController livelock that wedged 2.3.28-2.3.31 (see ISSUES.md K1). It is
+   also unnecessary: the classic symptom is a slave that was interrupted
+   mid-byte and is still holding SDA low, which the peripheral cannot clear on
+   its own but which nine clock pulses will.
+
+   Sequence: hand SCL/SDA to GPIO, pulse SCL up to 9 times until the slave
+   releases SDA, issue a manual STOP, then hand the pins back to the I2C
+   peripheral with i2c_param_config() - which re-routes the pin matrix without
+   touching the driver allocation. No heap churn, no interrupt re-registration. */
 static void accel_i2c_recover(void)
 {
-    ESP_LOGW(TAG, "accel: %d consecutive I2C fails — resetting bus", i2c_consecutive_fails);
-    i2c_driver_delete(I2C_MASTER_NUM);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    i2c_master_init();
-    vTaskDelay(pdMS_TO_TICKS(10));
-    InitAccelerometer_LIS3D();
+    /* No logging here: this runs on the 20Hz sampler and ESP_LOGW allocates and
+       formats. Surfaced as the i2crec ping attribute instead. */
+    i2c_recover_count++;
+
+    gpio_set_direction(I2C_MASTER_SCL_IO, GPIO_MODE_OUTPUT_OD);
+    gpio_set_direction(I2C_MASTER_SDA_IO, GPIO_MODE_INPUT_OUTPUT_OD);
+    gpio_set_level(I2C_MASTER_SDA_IO, 1);
+    gpio_set_level(I2C_MASTER_SCL_IO, 1);
+    esp_rom_delay_us(5);
+
+    for (int i = 0; i < 9 && gpio_get_level(I2C_MASTER_SDA_IO) == 0; i++) {
+        gpio_set_level(I2C_MASTER_SCL_IO, 0);
+        esp_rom_delay_us(5);
+        gpio_set_level(I2C_MASTER_SCL_IO, 1);
+        esp_rom_delay_us(5);
+    }
+
+    /* STOP condition: SDA rising while SCL is high. */
+    gpio_set_level(I2C_MASTER_SDA_IO, 0);
+    esp_rom_delay_us(5);
+    gpio_set_level(I2C_MASTER_SCL_IO, 1);
+    esp_rom_delay_us(5);
+    gpio_set_level(I2C_MASTER_SDA_IO, 1);
+    esp_rom_delay_us(5);
+
+    /* Return the pins to the I2C peripheral. Same config as i2c_master_init(),
+       minus the driver install - the driver is still there and still valid. */
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+    i2c_param_config(I2C_MASTER_NUM, &conf);
+
     i2c_consecutive_fails = 0;
 }
 
 /* Read one LIS3DH XYZ sample. HR mode ±2g: 12-bit left-justified, 1mg/LSB.
    0x80 on the register address enables auto-increment for the 6-byte burst.
-   Returns 1 on success, 0 on failure (triggers bus recovery after 20 misses). */
+   Returns 1 on success, 0 on failure (clears the bus after
+   ACCEL_FAILS_BEFORE_CLEAR misses). */
 static int accel_read_xyz(float *ax, float *ay, float *az)
 {
     uint8_t d[6];
-    if (motion_sensor_register_read(0x28 | 0x80, d, 6) != ESP_OK) {
-        if (++i2c_consecutive_fails >= 20)
+    uint8_t reg = 0x28 | 0x80;
+    if (i2c_master_write_read_device(I2C_MASTER_NUM, ACCLEROMETER_I2C_ADDRESS,
+                                     &reg, 1, d, 6,
+                                     I2C_ACCEL_TIMEOUT_MS / portTICK_PERIOD_MS) != ESP_OK) {
+        if (++i2c_consecutive_fails >= ACCEL_FAILS_BEFORE_CLEAR)
             accel_i2c_recover();
         return 0;
     }
@@ -1461,7 +1519,13 @@ static void HarshDriveTask(void *arg)
             force_ping_now = 1;
             last_alarm_us = now;
             latched = 1;
-            ESP_LOGW(TAG, "HARSH: accident %.2fg", hmag);
+            /* No ESP_LOGW here. printf-family formatting of floats on this 20Hz
+               task is the second suspect for the 2.3.28-2.3.31 livelock: it is
+               stack-hungry (a suspected overflow of the old 3072-byte stack,
+               trampling adjacent heap including BLE allocations) and takes the
+               stdout lock while the BLE host is running. The event reaches the
+               server as alarm= plus gmax= on the forced ping, which is the
+               only place it was ever actually needed. */
             continue;
         }
 
@@ -1474,7 +1538,7 @@ static void HarshDriveTask(void *arg)
                             : (ds >=  HARSH_SPEED_DELTA) ? 2 : 3;
                 force_ping_now = 1;
                 last_alarm_us = now;
-                ESP_LOGW(TAG, "HARSH: type=%d %.2fg ds=%.1fkm/h", harsh_alarm, hmag, ds);
+                /* No ESP_LOGW - see the accident branch above. */
             }
             latched = 1;
         }
@@ -4585,6 +4649,28 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         char g_part[20] = "";
         if (gmax_since_ping >= 0.05f)
             snprintf(g_part, sizeof(g_part), "&gmax=%.2f", gmax_since_ping);
+        /* Harsh-driving health (2.3.35). The 2.3.28-2.3.31 lockups gave no
+           server-side warning of what was degrading before the device wedged,
+           so the re-enable ships with the three numbers that discriminate
+           between the suspected causes:
+             hmin  - minimum free heap since boot (bytes). A slow slide points
+                     at allocation churn/fragmentation.
+             hstk  - HarshDriveTask stack high-water (bytes remaining). Trending
+                     toward 0 confirms the stack-overflow theory.
+             i2crec- bus clears since boot. Climbing means the I2C bus really is
+                     sticking, which was the original reason for the recovery
+                     path that is itself a livelock suspect.
+           A TWDT panic now reboots (uptime resets), so these are the last
+           readings before any wedge. */
+        char h_part[64] = "";
+#ifdef ENABLE_HARSH_DRIVING
+        snprintf(h_part, sizeof(h_part), "&hmin=%lu&hstk=%u&i2crec=%lu",
+                 (unsigned long)esp_get_minimum_free_heap_size(),
+                 harsh_task_handle
+                     ? (unsigned)(uxTaskGetStackHighWaterMark(harsh_task_handle) * sizeof(StackType_t))
+                     : 0u,
+                 (unsigned long)i2c_recover_count);
+#endif
         /* Timestamp only for a live GPS fix with a sane date. Cached/cell
            positions previously carried stale (or year-2000) fix times, so
            Traccar's "latest position" stayed pinned on old data; omitting
@@ -4610,7 +4696,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
             snprintf(gps_part, sizeof(gps_part), "&gpsage=%ld&gpsrec=%lu",
                      gps_age_s, (unsigned long)gnss_recover_count);
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s&fwver=" FW_VERSION,
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed / 1.852f, // OsmAnd speed param is knots
         ts_part,
@@ -4621,6 +4707,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         nl_part,
         gps_part,
         g_part,
+        h_part,
         _alarm);
     }
     Print("AT+HTTPPARA=\"URL\",\"");
@@ -8424,7 +8511,12 @@ void app_main(void)
     xTaskCreate(StartTimerTask, "StartTimerTask", 4096, NULL, 10, NULL);
     xTaskCreate(StartMainTask, "StartMainTask", 8192, NULL, 10, NULL); //TIMER_TASK_STACK_SIZE
 #ifdef ENABLE_HARSH_DRIVING
-    xTaskCreate(HarshDriveTask, "HarshDrive", 3072, NULL, 5, NULL); // 20Hz accel sampler (Phase 7b)
+    /* Stack raised 3072 -> 4096 in 2.3.35. A 3072-byte overflow trampling
+       adjacent heap (including BLE allocations) was one of the two suspects for
+       the btController livelock. The float printf that made overflow plausible
+       is gone too, but the headroom is cheap and the failure mode was a device
+       that wedged in the field for hours. Actual usage is reported as hstk. */
+    xTaskCreate(HarshDriveTask, "HarshDrive", 4096, NULL, 5, &harsh_task_handle); // 20Hz accel sampler (Phase 7b)
 #endif
     
     

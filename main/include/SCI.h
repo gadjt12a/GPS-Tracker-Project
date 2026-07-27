@@ -192,7 +192,18 @@ extern const char *TAG;
 // suspects are heap churn from the I2C driver delete/reinstall recovery path or
 // HarshDriveTask stack overflow trampling BLE heap. Re-enable only with the
 // 2.3.33 hardening plan (see phases roadmap / CLAUDE.md).
-// #define ENABLE_HARSH_DRIVING
+// RE-ENABLED in 2.3.35 with the hardening below applied:
+//   - HarshDriveTask stack 3072 -> 4096
+//   - all ESP_LOGW/printf removed from the 20Hz loop
+//   - I2C recovery replaced: SCL clock-pulse bus clear + i2c_param_config,
+//     instead of i2c_driver_delete/reinstall (no heap churn next to BLE)
+//   - accel burst read given its own 100ms timeout and a 5-failure recovery
+//     threshold, so a stuck bus can no longer outlast the 5s TWDT and
+//     panic-reboot before recovery is even attempted
+//   - hmin / hstk / i2crec attributes on every ping to show what degrades
+// If a unit wedges again, TWDT panic reboots it (uptime resets in Traccar) and
+// the last ping's attributes say which suspect was real.
+#define ENABLE_HARSH_DRIVING
 #define HARSH_EVENT_G       0.40f   // sustained horizontal accel = harsh event
 #define HARSH_EVENT_MS      300     // must stay above threshold this long
 #define HARSH_RESET_G       0.25f   // re-arm only after accel drops below this
@@ -202,7 +213,7 @@ extern const char *TAG;
 #define HARSH_MIN_SPEED     15.0f   // ignore events when peak involved speed below this (door slams etc.)
 
 // OTA firmware update
-#define FW_VERSION          "2.3.34"
+#define FW_VERSION          "2.3.35"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096
