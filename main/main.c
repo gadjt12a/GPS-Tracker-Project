@@ -530,6 +530,35 @@ uint32_t ota_check_timer = 0;   // seconds since last OTA check; 24hr periodic c
 float last_good_lat = 0.0f; // last GPS fix — persisted to NVS, survives reboots
 float last_good_lon = 0.0f;
 
+/* GNSS health tracking (2.3.33).
+   Field failure 2026-07-25/26: both units acquired normally after boot, then
+   the modem's GNSS stopped returning fixes mid-session and never recovered.
+   AT+CGNSSPWR=1 was only ever issued from InitGSM(), so with the network up
+   (no restart trigger) the devices ran 4 days replaying one stale position.
+   last_fix_us drives the gpsage attribute and the staleness cutoff; the
+   no-fix counter drives escalating GNSS recovery in XCheckGPS. */
+static int64_t last_fix_us = 0;         // esp_timer time of the last valid GPS fix; 0 = none this session
+static int64_t gnss_last_action_us = 0; // boot / last fix / last recovery attempt — escalation window start
+static int    gnss_recover_stage = 0;   // 0=none, 1=power-cycled, 2=cold-start, 3=modem reinit
+static uint32_t gnss_recover_count = 0; // recovery attempts since boot — reported as gpsrec
+
+/* A cached position older than this is worse than the cell-tower fix, which is
+   ~550m but current. Below it, the last GPS fix still wins. */
+#define GPS_STALE_SECONDS   600
+
+/* Time without a fix before the next recovery stage fires. Escalation is driven
+   by elapsed time, not poll count: XCheckGPS runs once per main-loop pass and
+   that period swings from ~1s when idle to minutes when a ping is in flight.
+   Two windows, because cold and warm acquisition differ by an order of
+   magnitude. Measured on the van 2026-07-27: after a V_RESET following 4 days
+   powered-off GNSS, time-to-first-fix was ~586s. A single 600s window would
+   have fired a power-cycle just before that fix landed and restarted the clock
+   — potentially looping forever without ever acquiring. A receiver that has
+   already fixed this session reacquires in seconds, so the warm window stays
+   tight enough to catch a real wedge quickly. */
+#define GNSS_RECOVER_AFTER_S    600   /* warm — had a fix this session */
+#define GNSS_COLDSTART_GRACE_S 1800   /* cold — no fix yet this session (TTFF ~10min observed) */
+
 /* 1-second GPS track buffer. Samples recorded while moving; drained as a
    batch inside the ping HTTP session so track resolution is 1s while the
    radio only does full session setup once per ping interval.
@@ -689,7 +718,11 @@ MotionStatusType INT1;
 #define I2C_MASTER_FREQ_HZ          400000                     /*!< I2C master clock frequency */
 #define I2C_MASTER_TX_BUF_DISABLE   0                          /*!< I2C master doesn't need buffer */
 #define I2C_MASTER_RX_BUF_DISABLE   0                          /*!< I2C master doesn't need buffer */
-#define I2C_MASTER_TIMEOUT_MS       50
+/* Restored to 1000 in 2.3.33. Dropped to 50 for the 20Hz HarshDriveTask so a
+   stuck bus couldn't stall the sampler; that task is compiled out since 2.3.32,
+   but the short timeout stayed and still governs the LIS3DH and the EEPROM
+   sharing this bus. */
+#define I2C_MASTER_TIMEOUT_MS       1000
 
 //#define MPU9250_SENSOR_ADDR                 0x68        /*!< Slave address of the MPU9250 sensor */
 #define ACCLEROMETER_WHO_AM_I_REG_ADDR           0x0F        /*!< Register addresses of the "who am I" register */
@@ -4346,28 +4379,35 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
                        NLat >= -90.0f && NLat <= 90.0f &&
                        NLong >= -180.0f && NLong <= 180.0f &&
                        !(NLat == 0.0f && NLong == 0.0f));
-    if (send_lat == 0.0f && send_lon == 0.0f) {
+    /* Age of the cached GPS position; <0 means no fix at all this session. */
+    long gps_age_s = (last_fix_us != 0)
+        ? (long)((esp_timer_get_time() - last_fix_us) / 1000000LL) : -1;
+
+    /* Fix A: SIM7672G cold-start artifact — GNSS reports a "valid" fix near the
+       origin while still acquiring. Treated as no-fix. */
+    bool origin_artifact = (send_lat > -1.0f && send_lat < 1.0f &&
+                            send_lon > -1.0f && send_lon < 3.0f);
+
+    if ((send_lat == 0.0f && send_lon == 0.0f) || origin_artifact) {
         live_fix = false;
-        if (last_good_lat != 0.0f) {
+        bool cache_valid = (last_good_lat != 0.0f);
+        /* Priority corrected in 2.3.33. The cached GPS fix used to win
+           unconditionally, so once GNSS died the device reported a coordinate
+           that grew days stale while a current cell fix sat unused in NLat/NLong.
+           A cache older than GPS_STALE_SECONDS now yields to the cell position:
+           ~550m and current beats metre-accurate and three days wrong. */
+        bool cache_fresh = cache_valid && gps_age_s >= 0 && gps_age_s < GPS_STALE_SECONDS;
+
+        if (cache_fresh) {
             send_lat = last_good_lat;
             send_lon = last_good_lon;
         } else if (cell_valid) {
-            /* Never had a GPS fix: cell-tower position (~100m-2km) beats nothing. */
             send_lat = NLat;
             send_lon = NLong;
-        } else if (!in_boot_window) {
-            return 0;
-        }
-    } else if (send_lat > -1.0f && send_lat < 1.0f && send_lon > -1.0f && send_lon < 3.0f) {
-        /* Fix A: SIM7672G cold-start artifact — GNSS reports a "valid" fix near
-           the origin while still acquiring. Treat as no-fix, use cache. */
-        live_fix = false;
-        if (last_good_lat != 0.0f) {
+        } else if (cache_valid) {
+            /* Stale, but the only position we have — still better than nothing. */
             send_lat = last_good_lat;
             send_lon = last_good_lon;
-        } else if (cell_valid) {
-            send_lat = NLat;
-            send_lon = NLong;
         } else if (!in_boot_window) {
             return 0;
         }
@@ -4558,8 +4598,17 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         char nl_part[80] = "";
         if (cell_valid)
             snprintf(nl_part, sizeof(nl_part), "&nlat=%f&nlon=%f&nacc=%d", NLat, NLong, NAccuracy);
+        /* GNSS health, so a dead receiver can never masquerade as a parked
+           vehicle again (2.3.33). gpsage = seconds since the last real fix,
+           -1 = none this session; gpsrec = recovery attempts since boot.
+           Only emitted when the position is NOT a live fix, keeping healthy
+           pings unchanged. */
+        char gps_part[40] = "";
+        if (!live_fix)
+            snprintf(gps_part, sizeof(gps_part), "&gpsage=%ld&gpsrec=%lu",
+                     gps_age_s, (unsigned long)gnss_recover_count);
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s&fwver=" FW_VERSION,
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed / 1.852f, // OsmAnd speed param is knots
         ts_part,
@@ -4568,6 +4617,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         ign_on ? "true" : "false",
         (unsigned long)(esp_timer_get_time() / 1000000ULL), // reboots visible server-side
         nl_part,
+        gps_part,
         g_part,
         _alarm);
     }
@@ -5401,6 +5451,56 @@ void XCheckGPS(void)
 
 #else // SIM7070
 
+/* Escalating GNSS recovery (2.3.33). Called from XCheckGPS once the modem has
+   gone long enough without a fix that a wedged GNSS engine is the likely cause.
+   Each stage is tried once per escalation cycle; the cycle restarts (back to
+   stage 1) after the next successful fix. Deliberately does NOT esp_restart —
+   a reboot drops the packet queue and track buffer, and the modem outlives it
+   anyway. Time-to-first-fix after a cold start is ~30-60s, so the caller must
+   allow that before escalating again. */
+static void GNSSRecover(void)
+{
+    /* Re-entrancy guard: stage 3 calls InitGSM(), which itself calls XCheckGPS()
+       for the reboot-ping timestamp. Without this, a stage-3 recovery that still
+       finds no fix recurses into GNSSRecover from inside InitGSM and overflows
+       the stack. Window is also restarted up-front (not on exit) so the nested
+       poll sees a fresh window even if it somehow bypasses the guard. */
+    static int gnss_recovering = 0;
+    if (gnss_recovering) return;
+    gnss_recovering = 1;
+    gnss_last_action_us = esp_timer_get_time();
+
+    gnss_recover_count++;
+    switch (++gnss_recover_stage)
+    {
+        case 1: /* Power-cycle just the GNSS engine — cheapest, fixes a wedged session. */
+            ESP_LOGW(TAG,"GNSS: no fix in window — power-cycling GNSS (attempt %lu)",
+                     (unsigned long)gnss_recover_count);
+            SendATCommand("AT+CGNSSPWR=0\r\n","OK","ERROR",10);
+            osDelay(2000);
+            SendATCommand("AT+CGNSSPWR=1\r\n","READY","ERROR",60);
+            break;
+
+        case 2: /* Ephemeris/almanac may be corrupt — force a cold start. */
+            ESP_LOGW(TAG,"GNSS: still no fix — cold start");
+            SendATCommand("AT+CGNSSPWR=1\r\n","READY","ERROR",60);
+            SendATCommand("AT+CGPSCOLD\r\n","OK","ERROR",30);
+            break;
+
+        default: /* Whole modem is suspect — full reinit, then start the ladder over. */
+            ESP_LOGW(TAG,"GNSS: still no fix — reinitialising modem");
+            DisableGSM();
+            InitGSM();
+            gnss_recover_stage = 0;
+            break;
+    }
+    /* Restart the window again on exit: stage 3 can spend a minute inside
+       InitGSM, and TTFF must be measured from when that finished, not from
+       when recovery began. */
+    gnss_last_action_us = esp_timer_get_time();
+    gnss_recovering = 0;
+}
+
 void XCheckGPS(void)
 {
     char *pToken;
@@ -5445,8 +5545,36 @@ void XCheckGPS(void)
         // {
         if(GPSStatus!='A')
         {
+            /* No fix — invalidate everything the ping path reads.
+               Before 2.3.33 only the vestigial Lat/Long char arrays were cleared
+               here, while fLat/fLong and the GPS clock kept their last values:
+               sscanf against "+CGPSINFO: ,,,,,,,," converts no fields and leaves
+               its targets untouched. LoadGPSTimeStamp() copies fLat/fLong with no
+               status check, so XHTTP_Request saw a non-zero lat, classified it as
+               a live fix, and shipped the stale coordinate with a frozen
+               timestamp — a dead GNSS was indistinguishable from a parked
+               vehicle. Field-confirmed 2026-07-27: unit -5783 resent the fix from
+               2026-07-25 03:58:22 UTC for two days straight.
+               Zeroed, the ping falls into the existing cached/cell path, which
+               already omits the timestamp so Traccar uses receive time. */
             memset(Lat,0,sizeof(Lat));
             memset(Long,0,sizeof(Long));
+            GPSDate[0] = '\0';   // extern char[] in main.c — no sizeof available
+            GPSTime[0] = '\0';
+            fLat = 0.0f; fLong = 0.0f; fSpeed = 0.0f;
+            GPSDay = GPSMonth = GPSYear = 0;
+            GPSHours = GPSMinutes = GPSSeconds = 0;
+
+            /* Escalate GNSS recovery once the no-fix window elapses. The window
+               is the generous cold-start grace until this session's first fix,
+               then tightens — see the GNSS_*_S comments. */
+            int64_t window_s = (last_fix_us != 0)
+                ? GNSS_RECOVER_AFTER_S : GNSS_COLDSTART_GRACE_S;
+            if (gnss_last_action_us == 0)
+                gnss_last_action_us = esp_timer_get_time();
+            else if (esp_timer_get_time() - gnss_last_action_us >
+                     window_s * 1000000LL)
+                GNSSRecover();
         }
         // pData = tBuff;
         // HeaderReceived = 0;
@@ -5483,6 +5611,11 @@ void XCheckGPS(void)
         {
             pfLat = fLat;
             pfLong = fLong;
+            /* Valid fix: reset the recovery ladder and restart the no-fix window
+               so a later failure starts again at the cheapest stage. */
+            last_fix_us = esp_timer_get_time();
+            gnss_last_action_us = last_fix_us;
+            gnss_recover_stage = 0;
         }
         if(GPSStatus != prevGPSStatus)
         {
