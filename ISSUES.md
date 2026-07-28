@@ -176,6 +176,41 @@ lacks `-mtune=esp-base`. Fix documented in CLAUDE.md.
 
 ## C. Defects found in review 2026-07-28
 
+### C11 — Ignition reports "running" for ~50 minutes after shutdown
+**P2 · FIXED in 2.3.36 (awaiting field confirmation)**
+
+`PowerSenseTick` used on `>13.3 V` / off `<13.0 V`. A freshly charged battery holds surface
+charge and rests at 13.0-13.2 V, i.e. **above** the OFF threshold, so after a drive the
+voltage had to decay for the best part of an hour before the flag cleared.
+
+Field evidence, van 2026-07-27:
+
+| Time | vbat | ignition |
+|---|---|---|
+| 19:53 | 14.39 | true (engine on) |
+| 20:37 | 13.015 | false - **44 min later** |
+| 21:41 | 14.455 | true |
+| 22:40 | 12.98 | false - **59 min later** |
+
+Three days of telemetry give a clean separation with an empty band between:
+
+| State | vbat |
+|---|---|
+| Alternator running | 14.11 - 14.48 V |
+| Engine off, resting | 12.67 - 13.10 V |
+| 13.2 - 14.0 | essentially empty |
+
+**Fix:** thresholds moved into the empty band - `IGNITION_ON_VOLTS` 13.8,
+`IGNITION_OFF_VOLTS` 13.5 (SCI.h, with the measured data recorded alongside). Debounce is
+now asymmetric: 3 s on, 15 s off, so an idling engine sagging under headlights/AC does not
+flicker the state while still clearing in seconds rather than an hour. Ignition transitions
+also set `force_ping_now`, so Traccar sees the edge immediately instead of up to 5 minutes
+later - trip start/end boundaries were being shifted by the parked ping interval.
+
+**Note:** this makes the alternator-output measurement in the roadmap unnecessary. The
+running voltage (14.11-14.48 V) is already established from field data across hundreds of
+samples on the actual vehicle.
+
 ### C10 — Release tooling is not under version control
 **P2 · FIXED 2026-07-28**
 

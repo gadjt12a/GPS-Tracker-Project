@@ -1347,15 +1347,25 @@ static void TrackSampleTick(void)
 }
 
 /* Debounced ignition + external-power state from ADCBatteryVoltage.
-   Called every second from the timer tick. 3s debounce on all transitions. */
+   Called every second from the timer tick. */
 static void PowerSenseTick(void)
 {
     float v = ADCBatteryVoltage;
     static int ign_cnt = 0, pwr_cnt = 0;
 
-    /* Ignition: on above 13.3V (alternator), off below 13.0V. */
-    if (ign_on ? (v < 13.0f) : (v > 13.3f)) {
-        if (++ign_cnt >= 3) { ign_on = !ign_on; ign_cnt = 0; }
+    /* Ignition. Thresholds and the field data behind them are in SCI.h.
+       Asymmetric debounce: prompt on, deliberate off. */
+    if (ign_on ? (v < IGNITION_OFF_VOLTS) : (v > IGNITION_ON_VOLTS)) {
+        int need = ign_on ? IGNITION_OFF_DEBOUNCE : IGNITION_ON_DEBOUNCE;
+        if (++ign_cnt >= need) {
+            ign_on = !ign_on;
+            ign_cnt = 0;
+            /* Report the transition immediately rather than waiting up to the
+               parked 5-minute interval. Traccar derives trip start/end from
+               ignition, so a late edge shifts the trip boundary by minutes.
+               Costs a handful of extra pings per day. */
+            force_ping_now = 1;
+        }
     } else {
         ign_cnt = 0;
     }

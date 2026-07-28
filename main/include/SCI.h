@@ -177,6 +177,28 @@ extern const char *TAG;
 //#define TAMPER_DETECT_MODE //  Bracelet removal detection for POWER_BUTTON
 
 
+/* Ignition detection from the vehicle bus (VCHG ADC).
+   Measured on the van from 3 days of field telemetry, 2026-07-26..28:
+       alternator running : 14.11 - 14.48 V   (hundreds of samples)
+       engine off, resting: 12.67 - 13.10 V
+       between 13.2 and 14.0: essentially empty
+   The previous 13.3 / 13.0 pair put the OFF threshold *below* a freshly
+   charged battery's resting voltage. After a drive the surface charge had to
+   decay for 45-60 minutes before crossing it, so the device reported
+   "engine running" for the best part of an hour after shutdown. Confirmed in
+   the field: engine off around 19:53, ignition=false not until 20:37.
+   These values sit in the empty band between the two measured clusters.
+
+   Debounce is asymmetric. Switching ON should be prompt. Switching OFF needs
+   to ride through brief sags - an idling engine under headlights/AC on a cold
+   night can dip toward 13.5 - without flickering the state. Both are still
+   vastly faster than the old behaviour. PowerSenseTick runs once per second,
+   so these counts are seconds. */
+#define IGNITION_ON_VOLTS      13.8f
+#define IGNITION_OFF_VOLTS     13.5f
+#define IGNITION_ON_DEBOUNCE      3
+#define IGNITION_OFF_DEBOUNCE    15
+
 #define TIME_TO_SLEEP 300
 #define PARK_LONG_SECONDS 172800UL   // 48 hours â€” threshold to enter deep sleep
 #define HEART_BEAT_INTERVAL (2*3600) // 2hr deep-sleep heartbeat wakeup — each wake also delivers queued Traccar commands (~30mAh/day on vehicle battery)
@@ -192,7 +214,21 @@ extern const char *TAG;
 // suspects are heap churn from the I2C driver delete/reinstall recovery path or
 // HarshDriveTask stack overflow trampling BLE heap. Re-enable only with the
 // 2.3.33 hardening plan (see phases roadmap / CLAUDE.md).
-// RE-ENABLED in 2.3.35 with the hardening below applied:
+// DISABLED AGAIN in 2.3.36. The 2.3.35 re-enable FAILED in the field: both
+// units wedged within minutes and never exceeded 29 minutes uptime, while
+// 2.3.34 runs for 5.5+ hours untouched. TWDT panic contained each wedge to
+// ~60s, but tracking collapsed (16 distinct positions vs 176 on 2.3.34) and
+// the van had to be recovered by hand because the reboots kept aborting its
+// own OTA download.
+//
+// Crucially the instrumentation stayed healthy through every wedge -
+// hstk 3320/4096 free, hmin 142272 bytes, i2crec 0 - so it is NOT stack
+// overflow, NOT heap exhaustion and NOT a stuck I2C bus. All three suspects
+// below are disproven. Do not simply re-enable this; the polling design
+// itself is implicated. See ISSUES.md K1 for the interrupt-driven redesign.
+//
+// The 2.3.35 hardening (kept in the code, still worth having):
+
 //   - HarshDriveTask stack 3072 -> 4096
 //   - all ESP_LOGW/printf removed from the 20Hz loop
 //   - I2C recovery replaced: SCL clock-pulse bus clear + i2c_param_config,
@@ -203,7 +239,7 @@ extern const char *TAG;
 //   - hmin / hstk / i2crec attributes on every ping to show what degrades
 // If a unit wedges again, TWDT panic reboots it (uptime resets in Traccar) and
 // the last ping's attributes say which suspect was real.
-#define ENABLE_HARSH_DRIVING
+// #define ENABLE_HARSH_DRIVING
 #define HARSH_EVENT_G       0.40f   // sustained horizontal accel = harsh event
 #define HARSH_EVENT_MS      300     // must stay above threshold this long
 #define HARSH_RESET_G       0.25f   // re-arm only after accel drops below this
@@ -213,7 +249,7 @@ extern const char *TAG;
 #define HARSH_MIN_SPEED     15.0f   // ignore events when peak involved speed below this (door slams etc.)
 
 // OTA firmware update
-#define FW_VERSION          "2.3.35"
+#define FW_VERSION          "2.3.36"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096
