@@ -77,7 +77,51 @@ moment Valetron ships a modem update.
 ## B. Known / previously documented
 
 ### K1 — btController livelock with `HarshDriveTask`
-**P1 · HARDENED in 2.3.35, awaiting field proof**
+**P1 · OPEN · 2.3.35 hardening FAILED · rolled back to 2.3.34 on 2026-07-28**
+
+**Result: all three suspected causes are disproven.**
+
+2.3.35 wedged both units within minutes of updating. Neither exceeded 29 minutes uptime;
+unit -5783 reset 8 times in 45 minutes, twice inside one minute. TWDT panic contained each
+wedge to ~60s instead of the multi-hour hangs of 2.3.28-2.3.31, but tracking collapsed: the
+van recorded **16 distinct positions on 2.3.35 against 176 on 2.3.34**, because every reboot
+discards the track buffer and restarts GPS acquisition.
+
+The instrumentation held steady through every single wedge:
+
+| Metric | Value throughout | Rules out |
+|---|---|---|
+| `hstk` | 3320 of 4096 free (~776 used) | Stack overflow |
+| `hmin` | 142,272 bytes | Heap exhaustion |
+| `i2crec` | 0 | Stuck I2C bus - recovery never even ran |
+
+So it is **not** the stack, **not** heap churn from the I2C driver delete/reinstall, and
+**not** the bus sticking. The entire 2.3.33-era hardening plan targeted the wrong things.
+Those were reasonable inferences from a TWDT trace, and they are now closed with data.
+
+What remains is what the original trace literally showed: `btController` occupying the CPU
+and starving everything else. The trigger appears to be running *any* continuous 20Hz I2C
+sampler alongside the BLE controller on the single-core C3 - a scheduling/contention
+interaction, not resource exhaustion.
+
+**Next approach - stop polling, do not harden further.** The LIS3DH has its own interrupt
+generators with configurable threshold and duration (`INT1_THS`, `INT1_DURATION`), and INT1
+is already wired and already used for motion wake. Harsh-driving thresholds (0.4g sustained
+300ms) map onto those registers directly, so detection can run in the sensor with no
+periodic I2C traffic at all - reading a short burst only when the interrupt fires. That
+removes the suspected cause instead of trying to survive it.
+
+Trade-off: hardware thresholds act on raw axes, losing the software gravity-compensation
+that makes the current detector mounting-angle agnostic. Either calibrate orientation once
+at install, or use the interrupt purely as a trigger and keep the maths in the burst read.
+
+**Cheap confirmation first (optional):** drop the sampler 20Hz -> 5Hz. If wedging stops or
+slows markedly, rate-dependent contention is confirmed before committing to the rewrite.
+
+**Testing constraint:** OTA has no per-device targeting, so any field test hits the van
+(live trial) as well as unit 2. Prefer USB-flashing unit 2 for experiments.
+
+**Original defect:**
 
 **Hardening applied (2.3.35), harsh driving re-enabled:**
 - Stack 3072 -> 4096 (suspect: overflow trampling adjacent BLE heap)
