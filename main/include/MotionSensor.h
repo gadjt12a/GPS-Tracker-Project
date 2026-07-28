@@ -44,6 +44,13 @@
 #define  REG_INT1_SRC  0x31
 #define  REG_INT1_THS  0x32
 #define  REG_INT1_DURATION  0x33
+/* Interrupt generator 2. The LIS3DH has two independent generators sharing the
+   physical INT1 pin (routed via CTRL_REG3). Generator 1 is motion wake at a low
+   threshold; generator 2 is harsh-driving detection at 0.4g (2.3.37+). */
+#define  REG_INT2_CFG  0x34
+#define  REG_INT2_SRC  0x35
+#define  REG_INT2_THS  0x36
+#define  REG_INT2_DURATION  0x37
 //#define  REG_CLICK_CFG  0x38
 //#define  REG_CLICK_SRC  0x39
 //#define  REG_CLICK_THS  0x3a

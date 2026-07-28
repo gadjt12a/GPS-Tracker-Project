@@ -227,29 +227,51 @@ extern const char *TAG;
 // below are disproven. Do not simply re-enable this; the polling design
 // itself is implicated. See ISSUES.md K1 for the interrupt-driven redesign.
 //
-// The 2.3.35 hardening (kept in the code, still worth having):
-
-//   - HarshDriveTask stack 3072 -> 4096
-//   - all ESP_LOGW/printf removed from the 20Hz loop
-//   - I2C recovery replaced: SCL clock-pulse bus clear + i2c_param_config,
-//     instead of i2c_driver_delete/reinstall (no heap churn next to BLE)
-//   - accel burst read given its own 100ms timeout and a 5-failure recovery
-//     threshold, so a stuck bus can no longer outlast the 5s TWDT and
-//     panic-reboot before recovery is even attempted
-//   - hmin / hstk / i2crec attributes on every ping to show what degrades
-// If a unit wedges again, TWDT panic reboots it (uptime resets in Traccar) and
-// the last ping's attributes say which suspect was real.
-// #define ENABLE_HARSH_DRIVING
+// ---------------------------------------------------------------------------
+// 2.3.37 REDESIGN: detection moved into the accelerometer hardware.
+//
+// The sampler is gone. The LIS3DH has two independent interrupt generators that
+// share the physical INT1 pin, and generator 2's threshold/duration registers
+// express "0.4g sustained for 300ms" directly - exactly the condition the 20Hz
+// task used to compute in software. The sensor now decides, and the firmware
+// only reacts when the pin asserts.
+//
+// Why this should not livelock: there is no periodic I2C traffic at all. The
+// interrupt is latched (LIR_INT2), so the existing ~1Hz INT1 poll in
+// StartMainTask cannot miss an event, and no new task is created. I2C is
+// touched only when something actually happens.
+// ---------------------------------------------------------------------------
+#define ENABLE_HARSH_DRIVING
 #define HARSH_EVENT_G       0.40f   // sustained horizontal accel = harsh event
 #define HARSH_EVENT_MS      300     // must stay above threshold this long
 #define HARSH_RESET_G       0.25f   // re-arm only after accel drops below this
-#define HARSH_ACCIDENT_G    1.85f   // near-clip spike = accident
+#define HARSH_ACCIDENT_G    1.85f   // near-clip spike = accident (stage 2, see below)
 #define HARSH_HOLDOFF_S     15      // min gap between harsh alarms
 #define HARSH_SPEED_DELTA   6.0f    // km/h change over 2s that classifies braking/accel vs cornering
 #define HARSH_MIN_SPEED     15.0f   // ignore events when peak involved speed below this (door slams etc.)
 
+/* Hardware register values, derived from the thresholds above so the two can
+   never drift apart.
+     THS  LSB = 16mg   at +-2g full scale (CTRL_REG4 = 0x08)
+     DUR  LSB = 1/ODR  = 10ms at 100Hz    (CTRL_REG1 = 0x57)
+   0.40g -> 25 counts, 300ms -> 30 counts. Both well inside the 7-bit fields. */
+#define LIS3DH_ODR_HZ            100
+#define LIS3DH_THS_MG_PER_LSB    16
+#define HARSH_THS_COUNTS   ((unsigned char)((HARSH_EVENT_G * 1000.0f) / LIS3DH_THS_MG_PER_LSB))
+#define HARSH_DUR_COUNTS   ((unsigned char)((HARSH_EVENT_MS * LIS3DH_ODR_HZ) / 1000))
+#define HARSH_SPD_HIST           4   // seconds of speed history for classification
+
+/* STAGE 2 (not implemented): accident severity. The hardware interrupt tells us
+   the threshold was crossed but not by how much, and because the pin is polled
+   at ~1Hz the event is over before we could read the peak. The clean answer is
+   the LIS3DH FIFO in Stream-to-FIFO mode: it continuously overwrites until the
+   interrupt triggers it, then freezes, preserving the event waveform for a
+   leisurely read. That also restores the gmax attribute. Deliberately deferred
+   so this build changes one thing only - whether removing the polling stops the
+   livelock. See ISSUES.md K1. */
+
 // OTA firmware update
-#define FW_VERSION          "2.3.36"
+#define FW_VERSION          "2.3.37"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096

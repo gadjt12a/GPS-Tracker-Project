@@ -589,25 +589,12 @@ static int ign_on = 0;        // debounced ignition state
 static int extpwr_on = -1;    // -1 until first debounced reading after boot
 static volatile int power_alarm = 0; // 1=powerCut, 2=powerRestored; cleared after successful send
 
-/* Harsh driving detection (Phase 7b). A 20Hz sampler task measures the
-   acceleration component perpendicular to gravity (mounting-angle agnostic)
-   and classifies sustained events by the GPS speed trend. Same delivery
-   pattern as power_alarm: rides a forced ping, cleared only on success. */
-static volatile int harsh_alarm = 0;        // 1=hardBraking 2=hardAcceleration 3=hardCornering 4=accident
+/* Harsh driving detection (Phase 7b). Since 2.3.37 the threshold and duration
+   test lives in the LIS3DH's second interrupt generator, not in a sampler task;
+   the firmware only classifies the event when the sensor reports one. Delivery
+   is the same pattern as power_alarm: rides a forced ping, cleared on success. */
+static volatile int harsh_alarm = 0;        // 1=hardBraking 2=hardAcceleration 3=hardCornering
 static int harsh_alarm_in_flight = 0;       // set while a harsh alarm is in the URL being sent
-static volatile float gmax_since_ping = 0;  // peak horizontal g between pings — threshold-tuning attribute
-static int i2c_consecutive_fails = 0;       // bus recovery counter
-static volatile uint32_t i2c_recover_count = 0; // bus clears since boot — reported as i2crec
-static TaskHandle_t harsh_task_handle = NULL;   // for stack high-water instrumentation
-
-/* Dedicated timeout for the 20Hz sampler's burst read, separate from the 1000ms
-   general I2C timeout used for EEPROM and config writes.
-   CONFIG_ESP_TASK_WDT_TIMEOUT_S is 5 with PANIC enabled, so at 1000ms per read
-   five consecutive stuck reads would panic-reboot the device — and the old code
-   only attempted recovery after 20 failures, i.e. it could never recover before
-   the reboot. 100ms x 5 failures = 500ms, comfortably inside the watchdog. */
-#define I2C_ACCEL_TIMEOUT_MS    100
-#define ACCEL_FAILS_BEFORE_CLEAR  5
 
 unsigned short HeartBeatTimer = 0;
 unsigned short NoSignalTimer=0;
@@ -952,10 +939,26 @@ void InitAccelerometer_LIS3D(void)
     
     osDelay(200);
    //  VALREAD = I2C_RdReg(REG_CTRL_REG1);
+#ifdef ENABLE_HARSH_DRIVING
+    /* 0x07: high-pass filter feeding BOTH interrupt generators (HP_IA1 | HP_IA2)
+       plus HPCLICK, so neither generator sees the 1g of gravity - thresholds are
+       on dynamic acceleration only. Without HP_IA2 the constant 1g would hold
+       generator 2 permanently triggered. */
+    I2C_WrReg(REG_CTRL_REG2, 0x07);
+    /* 0x60: route generator 1 (I1_IA1) AND generator 2 (I1_IA2) to the single
+       physical INT1 pin. Only one interrupt line is wired to the ESP32, so both
+       share it and INT1_SRC/INT2_SRC are read to tell them apart. */
+    I2C_WrReg(REG_CTRL_REG3, 0x60);
+    /* 0x0A: latch both (LIR_INT1 | LIR_INT2). Latching is what makes the ~1Hz
+       poll in StartMainTask safe - a 300ms event holds the pin until its SRC
+       register is read, so it cannot be missed between polls. */
+    I2C_WrReg(REG_CTRL_REG5, 0x0A);
+#else
     I2C_WrReg(REG_CTRL_REG2, 0x05);
     I2C_WrReg(REG_CTRL_REG3, 0x40);//    I2C_WrReg(MMA8652_CTRL_REG3, 0x39);
-    
+
     I2C_WrReg(REG_CTRL_REG5, 0x08);
+#endif
    // VALREAD = I2C_RdReg(REG_CTRL_REG5);
     I2C_WrReg(REG_CTRL_REG6, 0x02);
     //I2C_WrReg(REG_CTRL_REG6, 0xFF);
@@ -963,6 +966,16 @@ void InitAccelerometer_LIS3D(void)
     I2C_WrReg(REG_INT1_DURATION,0x00);
     I2C_WrReg(REG_INT1_CFG,0x2A);
     I2C_RdReg(REG_INT1_SRC); // Clear any latched interrupt so INT1 pin is de-asserted before sleep
+
+#ifdef ENABLE_HARSH_DRIVING
+    /* Generator 2 = harsh driving, entirely in hardware. THS/DURATION are
+       derived from HARSH_EVENT_G / HARSH_EVENT_MS in SCI.h. INT2_CFG 0x2A is
+       XHIE|YHIE|ZHIE with OR combination, so an excursion on any axis fires. */
+    I2C_WrReg(REG_INT2_THS, HARSH_THS_COUNTS);
+    I2C_WrReg(REG_INT2_DURATION, HARSH_DUR_COUNTS);
+    I2C_WrReg(REG_INT2_CFG, 0x2A);
+    I2C_RdReg(REG_INT2_SRC); // clear latch
+#endif
 
      for(i=0x07;i<=0x3F;i++)
     {
@@ -1383,176 +1396,81 @@ static void PowerSenseTick(void)
 }
 
 #ifdef ENABLE_HARSH_DRIVING
-/* Recover a stuck I2C bus by clocking it free, rather than tearing the driver
-   down and rebuilding it.
+/* Harsh driving detection (Phase 7b), redesigned in 2.3.37.
 
-   The previous implementation called i2c_driver_delete() + i2c_master_init() +
-   InitAccelerometer_LIS3D(). That frees and reallocates driver structures and
-   re-registers an interrupt, and doing so repeatedly alongside the BLE
-   controller's own allocations is one of the two suspects behind the
-   btController livelock that wedged 2.3.28-2.3.31 (see ISSUES.md K1). It is
-   also unnecessary: the classic symptom is a slave that was interrupted
-   mid-byte and is still holding SDA low, which the peripheral cannot clear on
-   its own but which nine clock pulses will.
+   Until now a 20Hz task polled the accelerometer over I2C and did the threshold
+   maths in software. Every build carrying that task wedged the device
+   (2.3.28-2.3.31, and again 2.3.35). The 2.3.35 instrumentation proved it was
+   not stack overflow, not heap exhaustion and not a stuck bus - which leaves
+   contention between continuous I2C traffic and the BLE controller on this
+   single-core part as the explanation.
 
-   Sequence: hand SCL/SDA to GPIO, pulse SCL up to 9 times until the slave
-   releases SDA, issue a manual STOP, then hand the pins back to the I2C
-   peripheral with i2c_param_config() - which re-routes the pin matrix without
-   touching the driver allocation. No heap churn, no interrupt re-registration. */
-static void accel_i2c_recover(void)
+   So the polling is gone. The LIS3DH's second interrupt generator is programmed
+   with the same threshold and duration the software used to apply - 0.4g held
+   for 300ms - and the sensor raises the shared INT1 pin when that happens (see
+   InitAccelerometer_LIS3D). Because the interrupt is latched, the existing ~1Hz
+   INT1 poll in StartMainTask cannot miss it. No new task, no periodic I2C, and
+   nothing running at all between events. */
+
+/* Speed history for classifying an event once it fires. Updated once per second
+   from the track-derived speed we already maintain: no sensor access, no
+   allocation, no I2C. */
+static float    harsh_spd_hist[HARSH_SPD_HIST] = {0};
+static int      harsh_spd_idx = 0;
+static int64_t  harsh_last_alarm_us = 0;
+static uint32_t harsh_event_count = 0;   // events since boot - reported as hcnt
+
+/* Called once per second from the timer tick. */
+static void HarshSpeedTick(void)
 {
-    /* No logging here: this runs on the 20Hz sampler and ESP_LOGW allocates and
-       formats. Surfaced as the i2crec ping attribute instead. */
-    i2c_recover_count++;
-
-    gpio_set_direction(I2C_MASTER_SCL_IO, GPIO_MODE_OUTPUT_OD);
-    gpio_set_direction(I2C_MASTER_SDA_IO, GPIO_MODE_INPUT_OUTPUT_OD);
-    gpio_set_level(I2C_MASTER_SDA_IO, 1);
-    gpio_set_level(I2C_MASTER_SCL_IO, 1);
-    esp_rom_delay_us(5);
-
-    for (int i = 0; i < 9 && gpio_get_level(I2C_MASTER_SDA_IO) == 0; i++) {
-        gpio_set_level(I2C_MASTER_SCL_IO, 0);
-        esp_rom_delay_us(5);
-        gpio_set_level(I2C_MASTER_SCL_IO, 1);
-        esp_rom_delay_us(5);
-    }
-
-    /* STOP condition: SDA rising while SCL is high. */
-    gpio_set_level(I2C_MASTER_SDA_IO, 0);
-    esp_rom_delay_us(5);
-    gpio_set_level(I2C_MASTER_SCL_IO, 1);
-    esp_rom_delay_us(5);
-    gpio_set_level(I2C_MASTER_SDA_IO, 1);
-    esp_rom_delay_us(5);
-
-    /* Return the pins to the I2C peripheral. Same config as i2c_master_init(),
-       minus the driver install - the driver is still there and still valid. */
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_MASTER_SDA_IO,
-        .scl_io_num = I2C_MASTER_SCL_IO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,
-    };
-    i2c_param_config(I2C_MASTER_NUM, &conf);
-
-    i2c_consecutive_fails = 0;
+    float spd = (track_live_speed_us != 0 &&
+                 esp_timer_get_time() - track_live_speed_us <= 10LL * 1000000LL)
+                    ? track_live_speed_kmh : 0.0f;
+    harsh_spd_hist[harsh_spd_idx] = spd;
+    harsh_spd_idx = (harsh_spd_idx + 1) % HARSH_SPD_HIST;
 }
 
-/* Read one LIS3DH XYZ sample. HR mode ±2g: 12-bit left-justified, 1mg/LSB.
-   0x80 on the register address enables auto-increment for the 6-byte burst.
-   Returns 1 on success, 0 on failure (clears the bus after
-   ACCEL_FAILS_BEFORE_CLEAR misses). */
-static int accel_read_xyz(float *ax, float *ay, float *az)
+static float harsh_speed_now(void)
 {
-    uint8_t d[6];
-    uint8_t reg = 0x28 | 0x80;
-    if (i2c_master_write_read_device(I2C_MASTER_NUM, ACCLEROMETER_I2C_ADDRESS,
-                                     &reg, 1, d, 6,
-                                     I2C_ACCEL_TIMEOUT_MS / portTICK_PERIOD_MS) != ESP_OK) {
-        if (++i2c_consecutive_fails >= ACCEL_FAILS_BEFORE_CLEAR)
-            accel_i2c_recover();
-        return 0;
-    }
-    i2c_consecutive_fails = 0;
-    *ax = (float)((int16_t)((d[1] << 8) | d[0]) >> 4) * 0.001f;
-    *ay = (float)((int16_t)((d[3] << 8) | d[2]) >> 4) * 0.001f;
-    *az = (float)((int16_t)((d[5] << 8) | d[4]) >> 4) * 0.001f;
-    return 1;
+    return harsh_spd_hist[(harsh_spd_idx + HARSH_SPD_HIST - 1) % HARSH_SPD_HIST];
 }
 
-static void HarshDriveTask(void *arg)
+static float harsh_speed_ago(void)   /* oldest entry, ~HARSH_SPD_HIST seconds back */
 {
-    esp_task_wdt_add(NULL);   // register so a stuck I2C shows this task in TWDT output, not IDLE
+    return harsh_spd_hist[harsh_spd_idx];
+}
 
-    const int PERIOD_MS = 50;                       // 20Hz
-    const int OVER_SAMPLES = HARSH_EVENT_MS / PERIOD_MS;
-    float gx = 0, gy = 0, gz = 0;                  // gravity estimate (EWMA, tau ~25s)
-    int seed = 40;                                  // fast-settle window after boot
-    int over = 0, accident_over = 0, latched = 0;
-    int64_t last_alarm_us = 0;
-    float spd_hist[4] = {0};                        // 500ms steps — [0]=now-2s
-    int tick = 0;
-    TickType_t wake = xTaskGetTickCount();
+/* Called from StartMainTask when the INT1 pin is asserted and INT2_SRC shows
+   generator 2 was the source. Classifies from the speed trend - braking,
+   acceleration, or neither (cornering) - and raises the alarm for the next
+   ping. Does no I2C of its own: the caller has already read INT2_SRC, and the
+   fact that it fired is the whole measurement. */
+static void HarshEventDetected(void)
+{
+    int64_t now = esp_timer_get_time();
 
-    for (;;) {
-        vTaskDelayUntil(&wake, pdMS_TO_TICKS(PERIOD_MS));
-        esp_task_wdt_reset();
+    /* Holdoff stops one rough stretch of road producing a burst of alarms. */
+    if (now - harsh_last_alarm_us <= (int64_t)HARSH_HOLDOFF_S * 1000000LL)
+        return;
 
-        float ax, ay, az;
-        if (!accel_read_xyz(&ax, &ay, &az))
-            continue;
+    float spd_now = harsh_speed_now();
+    float spd_old = harsh_speed_ago();
+    float peak    = (spd_now > spd_old) ? spd_now : spd_old;
 
-        float alpha = seed ? 0.05f : 0.002f;
-        if (seed) seed--;
-        gx += alpha * (ax - gx);
-        gy += alpha * (ay - gy);
-        gz += alpha * (az - gz);
-        float gmag2 = gx * gx + gy * gy + gz * gz;
-        if (gmag2 < 0.25f) continue;               // gravity estimate not settled/sane
+    /* Below urban pace this is a door slam, a kerb, or someone leaning on the
+       vehicle - not driving behaviour. */
+    if (peak < HARSH_MIN_SPEED) return;
+    if (harsh_alarm != 0) return;          /* one alarm pending at a time */
 
-        /* Linear accel minus its component along gravity = horizontal plane. */
-        float lx = ax - gx, ly = ay - gy, lz = az - gz;
-        float dot = (lx * gx + ly * gy + lz * gz) / gmag2;
-        float hx = lx - dot * gx, hy = ly - dot * gy, hz = lz - dot * gz;
-        float hmag = sqrtf(hx * hx + hy * hy + hz * hz);
-
-        if (hmag > gmax_since_ping) gmax_since_ping = hmag;
-
-        /* 500ms speed history for braking/acceleration/cornering classification. */
-        float spd_now = (track_live_speed_us != 0 &&
-                         esp_timer_get_time() - track_live_speed_us <= 10LL * 1000000LL)
-                            ? track_live_speed_kmh : 0.0f;
-        if (++tick >= 10) {
-            tick = 0;
-            spd_hist[0] = spd_hist[1]; spd_hist[1] = spd_hist[2];
-            spd_hist[2] = spd_hist[3]; spd_hist[3] = spd_now;
-        }
-
-        int moving = (MotionTimer <= 60) && (track_live_speed_us != 0 &&
-                      esp_timer_get_time() - track_live_speed_us <= 10LL * 1000000LL);
-        int64_t now = esp_timer_get_time();
-        int holdoff_ok = (now - last_alarm_us) > (int64_t)HARSH_HOLDOFF_S * 1000000LL;
-
-        if (latched) {                              // one alarm per excursion
-            if (hmag < HARSH_RESET_G) latched = 0;
-            continue;
-        }
-
-        /* Accident: near-clip spike, 2 consecutive samples. Checked first so a
-           crash isn't reported as mere hard braking. */
-        accident_over = (hmag >= HARSH_ACCIDENT_G) ? accident_over + 1 : 0;
-        if (accident_over >= 2 && moving && holdoff_ok) {
-            harsh_alarm = 4;
-            force_ping_now = 1;
-            last_alarm_us = now;
-            latched = 1;
-            /* No ESP_LOGW here. printf-family formatting of floats on this 20Hz
-               task is the second suspect for the 2.3.28-2.3.31 livelock: it is
-               stack-hungry (a suspected overflow of the old 3072-byte stack,
-               trampling adjacent heap including BLE allocations) and takes the
-               stdout lock while the BLE host is running. The event reaches the
-               server as alarm= plus gmax= on the forced ping, which is the
-               only place it was ever actually needed. */
-            continue;
-        }
-
-        over = (hmag >= HARSH_EVENT_G) ? over + 1 : 0;
-        if (over >= OVER_SAMPLES && moving && holdoff_ok) {
-            float ds = spd_now - spd_hist[0];      // km/h change over ~2s
-            float peak_spd = (spd_now > spd_hist[0]) ? spd_now : spd_hist[0];
-            if (peak_spd >= HARSH_MIN_SPEED && harsh_alarm == 0) {
-                harsh_alarm = (ds <= -HARSH_SPEED_DELTA) ? 1
-                            : (ds >=  HARSH_SPEED_DELTA) ? 2 : 3;
-                force_ping_now = 1;
-                last_alarm_us = now;
-                /* No ESP_LOGW - see the accident branch above. */
-            }
-            latched = 1;
-        }
-    }
+    float ds = spd_now - spd_old;
+    harsh_alarm = (ds <= -HARSH_SPEED_DELTA) ? 1     /* hardBraking */
+                : (ds >=  HARSH_SPEED_DELTA) ? 2     /* hardAcceleration */
+                :                              3;    /* hardCornering */
+    harsh_last_alarm_us = now;
+    harsh_event_count++;
+    force_ping_now = 1;
+    /* No logging here. printf on this path was a livelock suspect, and the
+       event reaches the server as alarm= on the forced ping regardless. */
 }
 #endif // ENABLE_HARSH_DRIVING
 
@@ -3192,6 +3110,9 @@ void StartTimerTask(void *argument)
         if (SystemTimer % TRACK_SAMPLE_SECONDS == 0)
             TrackSampleTick();
         PowerSenseTick();
+#ifdef ENABLE_HARSH_DRIVING
+        HarshSpeedTick();   // 1Hz speed history for classifying harsh events
+#endif
 //        #ifndef MOTION_CONTROLLED_PINGS
 //        MotionTimer=0;
 //        #endif
@@ -4654,32 +4575,20 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         else if (harsh_alarm == 2) { _alarm = "&alarm=hardAcceleration"; harsh_alarm_in_flight = 1; }
         else if (harsh_alarm == 3) { _alarm = "&alarm=hardCornering";    harsh_alarm_in_flight = 1; }
         else                       { _alarm = ""; }
-        /* Peak horizontal g since last ping — field data for tuning HARSH_EVENT_G.
-           Suppressed when negligible to keep parked pings clean. */
-        char g_part[20] = "";
-        if (gmax_since_ping >= 0.05f)
-            snprintf(g_part, sizeof(g_part), "&gmax=%.2f", gmax_since_ping);
-        /* Harsh-driving health (2.3.35). The 2.3.28-2.3.31 lockups gave no
-           server-side warning of what was degrading before the device wedged,
-           so the re-enable ships with the three numbers that discriminate
-           between the suspected causes:
-             hmin  - minimum free heap since boot (bytes). A slow slide points
-                     at allocation churn/fragmentation.
-             hstk  - HarshDriveTask stack high-water (bytes remaining). Trending
-                     toward 0 confirms the stack-overflow theory.
-             i2crec- bus clears since boot. Climbing means the I2C bus really is
-                     sticking, which was the original reason for the recovery
-                     path that is itself a livelock suspect.
-           A TWDT panic now reboots (uptime resets), so these are the last
-           readings before any wedge. */
-        char h_part[64] = "";
+        /* gmax is gone in 2.3.37. It was the peak horizontal g measured by the
+           20Hz sampler, and there is no sampler any more. Restoring it needs the
+           FIFO capture described in SCI.h (stage 2). */
+        char g_part[1] = "";
+        /* Harsh-driving health. hstk and i2crec are also gone with the task -
+           there is no task stack to watch and no polling to stick the bus.
+           What remains is worth keeping: hmin is a general leak/fragmentation
+           canary, and hcnt says whether detection is actually firing, which is
+           the thing to check after a drive. */
+        char h_part[48] = "";
 #ifdef ENABLE_HARSH_DRIVING
-        snprintf(h_part, sizeof(h_part), "&hmin=%lu&hstk=%u&i2crec=%lu",
+        snprintf(h_part, sizeof(h_part), "&hmin=%lu&hcnt=%lu",
                  (unsigned long)esp_get_minimum_free_heap_size(),
-                 harsh_task_handle
-                     ? (unsigned)(uxTaskGetStackHighWaterMark(harsh_task_handle) * sizeof(StackType_t))
-                     : 0u,
-                 (unsigned long)i2c_recover_count);
+                 (unsigned long)harsh_event_count);
 #endif
         /* Timestamp only for a live GPS fix with a sane date. Cached/cell
            positions previously carried stale (or year-2000) fix times, so
@@ -4921,7 +4830,6 @@ SUCCESS:
        from the other source rides the next ping. Failed sends keep both. */
     if (harsh_alarm_in_flight) { harsh_alarm = 0; harsh_alarm_in_flight = 0; }
     else                       { power_alarm = 0; }
-    gmax_since_ping = 0; // peak reported; restart measurement window
     ClearEventCache();
     if(RFIDDataPresent==1)
     {
@@ -7408,7 +7316,19 @@ ESP_LOGI(TAG,"Entered main task");
             //    VALREAD = I2C_RdReg(i);
             //    INT1 = (MotionStatusType)gpio_get_level(GPIO_INT1);
             //}
-           
+
+#ifdef ENABLE_HARSH_DRIVING
+            /* Both LIS3DH interrupt generators share this pin, so work out
+               which one raised it. Generator 2 = harsh driving.
+               MUST be read before InitAccelerometer() below: that sweeps
+               registers 0x07-0x3F, which includes INT2_SRC (0x35), and reading
+               INT2_SRC is what clears the latch. Doing it the other way round
+               would silently swallow every harsh event.
+               Bit 6 (0x40) is IA - "one or more interrupts generated". */
+            if (I2C_RdReg(REG_INT2_SRC) & 0x40)
+                HarshEventDetected();
+#endif
+
             ISRstatus = I2C_RdReg(REG_INT1_SRC);
             InitAccelerometer();
            
@@ -8520,14 +8440,8 @@ void app_main(void)
     xTaskCreate(ADCTask, "ADCTask", 2048, NULL, 10, NULL);
     xTaskCreate(StartTimerTask, "StartTimerTask", 4096, NULL, 10, NULL);
     xTaskCreate(StartMainTask, "StartMainTask", 8192, NULL, 10, NULL); //TIMER_TASK_STACK_SIZE
-#ifdef ENABLE_HARSH_DRIVING
-    /* Stack raised 3072 -> 4096 in 2.3.35. A 3072-byte overflow trampling
-       adjacent heap (including BLE allocations) was one of the two suspects for
-       the btController livelock. The float printf that made overflow plausible
-       is gone too, but the headroom is cheap and the failure mode was a device
-       that wedged in the field for hours. Actual usage is reported as hstk. */
-    xTaskCreate(HarshDriveTask, "HarshDrive", 4096, NULL, 5, &harsh_task_handle); // 20Hz accel sampler (Phase 7b)
-#endif
+    /* No harsh-driving task since 2.3.37 - detection is done by the LIS3DH's
+       own interrupt generator and handled from the existing INT1 poll. */
     
     
     
