@@ -932,7 +932,9 @@ void InitAccelerometer_LIS3D(void)
     }
 
 
-    VALREAD = I2C_RdReg(0x26);
+    /* The read of 0x26 (REFERENCE) that used to be here is removed in 2.3.39 -
+       it reset the high-pass filter on every call. HPM=10 below now makes that
+       harmless anyway, but there is no reason to do it. */
     VALREAD = I2C_RdReg(0x0F);//VALREAD = I2C_RdReg(0x0D);
     I2C_WrReg(REG_CTRL_REG1, 0x57);// LPEN bit 3
     I2C_WrReg(REG_CTRL_REG4, 0x08);// HR bit 3
@@ -954,8 +956,16 @@ void InitAccelerometer_LIS3D(void)
        Field-confirmed on 2.3.37 - hcnt stayed 0 across 44 ignition-on pings with
        driving up to 76km/h.
        11 selects the lowest cutoff (~0.25Hz), which still blocks DC gravity but
-       passes anything shorter than roughly four seconds essentially intact. */
-    I2C_WrReg(REG_CTRL_REG2, 0x37);
+       passes anything shorter than roughly four seconds essentially intact.
+
+       Bits 7:6 are HPM, the filter mode. 2.3.38 left them at 00 - "normal mode,
+       filter reset by reading REFERENCE" - which was the real 2.3.37/2.3.38
+       failure: InitAccelerometer() reads REFERENCE (0x26), runs about once a
+       second while driving because motion interrupts fire continuously, and so
+       slammed the filter output back to zero before it could ever integrate the
+       300ms needed to trigger. 10 selects plain normal mode, where reading
+       REFERENCE has no such side effect. */
+    I2C_WrReg(REG_CTRL_REG2, 0xB7);
     /* 0x60: route generator 1 (I1_IA1) AND generator 2 (I1_IA2) to the single
        physical INT1 pin. Only one interrupt line is wired to the ESP32, so both
        share it and INT1_SRC/INT2_SRC are read to tell them apart. */
@@ -988,13 +998,14 @@ void InitAccelerometer_LIS3D(void)
     I2C_RdReg(REG_INT2_SRC); // clear latch
 #endif
 
-     for(i=0x07;i<=0x3F;i++)
-    {
-       ReadBuff[i] = I2C_RdReg(i);
-        
-    }
-    ReadBuff[0]=ReadBuff[0];
-    
+    /* The debug sweep that used to live here - reading every register 0x07-0x3F
+       into a buffer that was then discarded (ReadBuff[0]=ReadBuff[0];) - is gone
+       in 2.3.39. Besides costing 57 pointless I2C reads on every call, it read:
+         0x26 REFERENCE  - resetting the high-pass filter
+         0x31 INT1_SRC   - clearing the motion latch
+         0x35 INT2_SRC   - clearing a pending HARSH EVENT before anyone saw it
+       Since this function runs on every motion interrupt, i.e. about once a
+       second while driving, that combination made harsh detection impossible. */
 }
 
 
@@ -4180,10 +4191,22 @@ char XUDP_Request(char *pFilename, unsigned char pingtype)
 //            #else
 //            InitAccelerometer_mma84();
 //            #endif
+#ifdef ENABLE_HARSH_DRIVING
+            /* This runs inside the ping wait loop, i.e. every 30s while driving.
+               Before 2.3.39 it called InitAccelerometer() unconditionally, whose
+               register sweep cleared INT2_SRC - so any harsh event latched during
+               a ping was silently discarded here before the main loop could see
+               it. Check the generator first, then leave re-initialisation to the
+               throttled path in StartMainTask. */
+            if (I2C_RdReg(REG_INT2_SRC) & 0x40)
+                HarshEventDetected();
+            ISRstatus = I2C_RdReg(REG_INT1_SRC);   // release the pin
+#else
             InitAccelerometer();
+#endif
             if(MotionTimer > 120)
             {
-                PostMotionEvent();                
+                PostMotionEvent();
                 #ifndef TIMER_ONLY_WAKEUP
                     MotionTimer=0;
                 #endif
@@ -7341,22 +7364,36 @@ ESP_LOGI(TAG,"Entered main task");
             //}
 
 #ifdef ENABLE_HARSH_DRIVING
-            /* Both LIS3DH interrupt generators share this pin, so work out
-               which one raised it. Generator 2 = harsh driving.
-               MUST be read before InitAccelerometer() below: that sweeps
-               registers 0x07-0x3F, which includes INT2_SRC (0x35), and reading
-               INT2_SRC is what clears the latch. Doing it the other way round
-               would silently swallow every harsh event.
+            /* Both LIS3DH interrupt generators share this pin, so work out which
+               one raised it. Generator 2 = harsh driving. Read this first: the
+               throttled re-init below can also clear the latch.
                Bit 6 (0x40) is IA - "one or more interrupts generated". */
             if (I2C_RdReg(REG_INT2_SRC) & 0x40)
                 HarshEventDetected();
 #endif
 
+            /* Clearing the latch is the part that matters here - it releases the
+               pin so the next event can be seen. */
             ISRstatus = I2C_RdReg(REG_INT1_SRC);
-            InitAccelerometer();
-           
-//            InitAccelerometer();
-            
+
+            /* Full re-initialisation is now throttled to once a minute (2.3.39).
+               It used to run on EVERY motion interrupt, which while driving means
+               roughly once a second, and each run rewrote INT2_CFG - resetting
+               generator 2's duration counter before it could ever accumulate the
+               300ms needed to fire. Together with the REFERENCE read and the
+               register sweep (both removed above) that made harsh detection
+               impossible: hraw stayed 0 across a full test drive on 2.3.38.
+               Kept at a low rate because it is the only recovery path if the
+               sensor loses its configuration, and motion wake depends on it. */
+            {
+                static int64_t last_accel_init_us = 0;
+                int64_t _now = esp_timer_get_time();
+                if (_now - last_accel_init_us > 60LL * 1000000LL) {
+                    last_accel_init_us = _now;
+                    InitAccelerometer();
+                }
+            }
+
             if(MotionTimer > TIME_TO_SLEEP)
             {
                 //PostMotionEvent();
