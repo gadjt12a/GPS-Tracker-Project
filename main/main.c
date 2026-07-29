@@ -940,11 +940,22 @@ void InitAccelerometer_LIS3D(void)
     osDelay(200);
    //  VALREAD = I2C_RdReg(REG_CTRL_REG1);
 #ifdef ENABLE_HARSH_DRIVING
-    /* 0x07: high-pass filter feeding BOTH interrupt generators (HP_IA1 | HP_IA2)
-       plus HPCLICK, so neither generator sees the 1g of gravity - thresholds are
-       on dynamic acceleration only. Without HP_IA2 the constant 1g would hold
-       generator 2 permanently triggered. */
-    I2C_WrReg(REG_CTRL_REG2, 0x07);
+    /* High-pass filter feeding BOTH interrupt generators (HP_IA1 | HP_IA2) plus
+       HPCLICK, so neither generator sees the 1g of gravity - thresholds apply to
+       dynamic acceleration only. Without HP_IA2 the constant 1g would hold
+       generator 2 permanently triggered.
+
+       0x37, not 0x07: bits 5:4 are HPCF2:HPCF1, the filter cutoff. 2.3.37 left
+       them at 00, which is the HIGHEST cutoff - about 2Hz at our 100Hz ODR. That
+       was a mistake. Harsh braking and cornering are SUSTAINED forces lasting
+       several hundred ms, i.e. low frequency (~1.7Hz for a 300ms event), so a
+       2Hz high-pass attenuated the very signal being measured: a real 0.5g brake
+       could reach the comparator as ~0.25g and never cross the 400mg threshold.
+       Field-confirmed on 2.3.37 - hcnt stayed 0 across 44 ignition-on pings with
+       driving up to 76km/h.
+       11 selects the lowest cutoff (~0.25Hz), which still blocks DC gravity but
+       passes anything shorter than roughly four seconds essentially intact. */
+    I2C_WrReg(REG_CTRL_REG2, 0x37);
     /* 0x60: route generator 1 (I1_IA1) AND generator 2 (I1_IA2) to the single
        physical INT1 pin. Only one interrupt line is wired to the ESP32, so both
        share it and INT1_SRC/INT2_SRC are read to tell them apart. */
@@ -1418,7 +1429,14 @@ static void PowerSenseTick(void)
 static float    harsh_spd_hist[HARSH_SPD_HIST] = {0};
 static int      harsh_spd_idx = 0;
 static int64_t  harsh_last_alarm_us = 0;
-static uint32_t harsh_event_count = 0;   // events since boot - reported as hcnt
+static uint32_t harsh_event_count = 0;   // events that passed the gates - reported as hcnt
+/* Raw generator-2 interrupts, counted before ANY gating (speed, holdoff,
+   already-pending). Added in 2.3.38 because hcnt alone could not distinguish
+   "the sensor never fired" from "it fired and we discarded it" - which is
+   exactly the ambiguity that made 2.3.37's hcnt=0 result hard to act on.
+   hraw > 0 with hcnt == 0 means the gates are wrong; hraw == 0 means the
+   threshold or filter is wrong. */
+static uint32_t harsh_raw_count = 0;     // reported as hraw
 
 /* Called once per second from the timer tick. */
 static void HarshSpeedTick(void)
@@ -1448,6 +1466,10 @@ static float harsh_speed_ago(void)   /* oldest entry, ~HARSH_SPD_HIST seconds ba
 static void HarshEventDetected(void)
 {
     int64_t now = esp_timer_get_time();
+
+    /* Counted first, before every gate below, so hraw reflects what the sensor
+       actually reported rather than what survived filtering. */
+    harsh_raw_count++;
 
     /* Holdoff stops one rough stretch of road producing a burst of alarms. */
     if (now - harsh_last_alarm_us <= (int64_t)HARSH_HOLDOFF_S * 1000000LL)
@@ -4584,11 +4606,12 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
            What remains is worth keeping: hmin is a general leak/fragmentation
            canary, and hcnt says whether detection is actually firing, which is
            the thing to check after a drive. */
-        char h_part[48] = "";
+        char h_part[64] = "";
 #ifdef ENABLE_HARSH_DRIVING
-        snprintf(h_part, sizeof(h_part), "&hmin=%lu&hcnt=%lu",
+        snprintf(h_part, sizeof(h_part), "&hmin=%lu&hcnt=%lu&hraw=%lu",
                  (unsigned long)esp_get_minimum_free_heap_size(),
-                 (unsigned long)harsh_event_count);
+                 (unsigned long)harsh_event_count,
+                 (unsigned long)harsh_raw_count);
 #endif
         /* Timestamp only for a live GPS fix with a sane date. Cached/cell
            positions previously carried stale (or year-2000) fix times, so

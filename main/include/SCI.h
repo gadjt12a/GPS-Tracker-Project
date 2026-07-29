@@ -271,7 +271,7 @@ extern const char *TAG;
    livelock. See ISSUES.md K1. */
 
 // OTA firmware update
-#define FW_VERSION          "2.3.37"
+#define FW_VERSION          "2.3.38"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096
