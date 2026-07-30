@@ -540,6 +540,22 @@ float last_good_lon = 0.0f;
    no-fix counter drives escalating GNSS recovery in XCheckGPS. */
 static int64_t last_fix_us = 0;         // esp_timer time of the last valid GPS fix; 0 = none this session
 static int64_t gnss_last_action_us = 0; // boot / last fix / last recovery attempt — escalation window start
+
+/* Frozen-clock detection (2.3.40).
+   A second GNSS failure mode, distinct from the empty-response case 2.3.33
+   handles: the modem keeps answering AT+CGPSINFO with a well-formed sentence
+   whose contents never change. GPSStatus reads 'A', fLat/fLong are non-zero, so
+   the position is reported as a live fix and nothing downstream can tell.
+   Field case 2026-07-30: the van's GPS clock stopped at 09:14:05 UTC and the
+   same fix was resent for 13h49m across 202 pings. A drive inside that window
+   recorded no track samples, no speed and no trip - and gpsage never appeared,
+   because gpsage is only emitted when live_fix is false.
+   A healthy receiver reports current UTC on every poll, so a GPS clock that has
+   not advanced in this long means the fix is stale however valid it looks. */
+static long    last_gps_ts = 0;          // GPS unix ts from the previous poll
+static int64_t last_gps_ts_change_us = 0;// esp_timer time that ts last changed
+static bool    gnss_frozen = false;      // clock stopped advancing = receiver definitely broken
+#define GPS_FROZEN_SECONDS  120
 static int    gnss_recover_stage = 0;   // 0=none, 1=power-cycled, 2=cold-start, 3=modem reinit
 static uint32_t gnss_recover_count = 0; // recovery attempts since boot — reported as gpsrec
 static int    gnss_backoff_mult = 1;    // window multiplier, doubles per failed recovery, reset on fix
@@ -5600,6 +5616,40 @@ void XCheckGPS(void)
         memset(Altitude,0,sizeof(Altitude));
         
         sscanf(pToken,"+CGPSINFO: %f,%c,%f,%c,%[^,],%[^,],%f,%f,%f\r\n",&fLat,&NS,&fLong,&EW,GPSDate,GPSTime,&fAltitude,&tfSpeed,&fCourse);
+
+        /* Date/time parsed here (moved ahead of the validity check in 2.3.40) so
+           the frozen-clock test below can run before anything acts on the fix.
+           On a no-fix response GPSDate/GPSTime are empty, sscanf converts
+           nothing, and the block below zeroes these anyway. */
+        sscanf( (void*)GPSDate, "%2d%2d%2d", (int*)&GPSDay,(int*)&GPSMonth,(int*)&GPSYear);
+        sscanf( (void*)GPSTime, "%2d%2d%2d", (int*)&GPSHours,(int*)&GPSMinutes,(int*)&GPSSeconds);
+
+        /* Frozen-clock check. The modem can keep answering with a well-formed
+           sentence whose contents never change - a stale fix that looks
+           completely valid. A working receiver stamps every poll with current
+           UTC, so a GPS clock that has not moved for GPS_FROZEN_SECONDS means
+           the fix is dead no matter how healthy the sentence looks. Demote it to
+           'V' and let the existing no-fix path below do the rest: zero the
+           position, surface gpsage, and let the watchdog power-cycle the
+           receiver. Field case: the van's clock stopped at 2026-07-30 09:14:05
+           UTC and the same fix was resent for 13h49m, straight through a drive,
+           with no attribute anywhere showing a problem. */
+        if (GPSStatus == 'A' && GPSYear >= 20) {
+            long _ts = osmand_unix_ts(GPSYear, GPSMonth, GPSDay,
+                                      GPSHours, GPSMinutes, GPSSeconds);
+            int64_t _now = esp_timer_get_time();
+            if (_ts != last_gps_ts) {
+                last_gps_ts = _ts;
+                last_gps_ts_change_us = _now;
+                gnss_frozen = false;          // clock moving again
+            } else if (last_gps_ts_change_us != 0 &&
+                       _now - last_gps_ts_change_us >
+                           (int64_t)GPS_FROZEN_SECONDS * 1000000LL) {
+                GPSStatus = 'V';
+                gnss_frozen = true;
+            }
+        }
+
         // while(1)
         // {
         if(GPSStatus!='A')
@@ -5641,7 +5691,15 @@ void XCheckGPS(void)
                the vehicle moves off, instead of firing a power-cycle instantly at
                ignition-on and restarting time-to-first-fix just as the receiver
                finally gets a clear view of the sky. */
-            bool gnss_active = ign_on || (MotionTimer <= 60);
+            /* gnss_frozen bypasses the parked gate (2.3.40). "No fix" is
+               ambiguous - a parked vehicle under a carport roof looks identical
+               to a dead receiver, which is why escalation waits for activity.
+               A clock that has stopped advancing is not ambiguous: the receiver
+               is broken, and it will stay broken until something restarts it.
+               Waiting for the next drive would mean the fault persists through
+               it - exactly what happened on 2026-07-30, where the freeze began
+               while parked and the whole morning commute went unrecorded. */
+            bool gnss_active = ign_on || (MotionTimer <= 60) || gnss_frozen;
             int64_t window_s = (last_fix_us != 0)
                 ? GNSS_RECOVER_AFTER_S : GNSS_COLDSTART_GRACE_S;
             window_s *= gnss_backoff_mult;
@@ -5665,12 +5723,8 @@ void XCheckGPS(void)
         else
             fSpeed=0;
         // sscanf( (void*)Course, "%f", &fCourse);
-
-        sscanf( (void*)GPSDate, "%2d%2d%2d", (int*)&GPSDay,(int*)&GPSMonth,(int*)&GPSYear);
-                                
-        sscanf( (void*)GPSTime, "%2d%2d%2d", (int*)&GPSHours,(int*)&GPSMinutes,(int*)&GPSSeconds);
-        // printf("%s,%d,%d,%d\n",GPSDate,GPSDay,GPSMonth,GPSYear);
-        // printf("%s,%d,%d,%d\n",GPSTime,GPSHours,GPSMinutes,GPSSeconds);
+        // (GPSDate/GPSTime are parsed further up since 2.3.40 - see the
+        //  frozen-clock check.)
 
         if(NS == 'S')fLat *= -1;
         if(EW == 'W')fLong *= -1;
