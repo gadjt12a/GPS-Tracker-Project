@@ -1464,6 +1464,44 @@ static uint32_t harsh_event_count = 0;   // events that passed the gates - repor
    hraw > 0 with hcnt == 0 means the gates are wrong; hraw == 0 means the
    threshold or filter is wrong. */
 static uint32_t harsh_raw_count = 0;     // reported as hraw
+/* Last raw INT2_SRC byte seen by the poll, so the diagnostic shows the whole
+   register rather than just the result of testing bit 6. 0xFF = never read. */
+static unsigned char last_int2_src = 0xFF;
+
+/* Diagnostic readback (2.3.41). Three fix attempts for "harsh detection never
+   fires" have now failed - stack/heap/I2C (2.3.35), HPF cutoff (2.3.38), and
+   InitAccelerometer resetting the generator state (2.3.39) - each based on an
+   inferred mechanism rather than a measurement. This reads the sensor's own
+   configuration back at ping time (not just after writing it, so an later
+   overwrite is still caught) and reports it verbatim.
+
+   Expected if everything assumed is true: 33,57,B7,60,08,0A,2A,19,1E
+     WHO_AM_I  0x33 = LIS3DH. Anything else means it is a different chip and
+                      every harsh register write has gone somewhere meaningless
+                      - the driver also supports MMA8652/8653/8452, where 0x34
+                      is not INT2_CFG at all.
+     CTRL_REG1 0x57 = 100Hz ODR, all axes  (sets the DURATION tick to 10ms)
+     CTRL_REG2 0xB7 = HPM=10, lowest cutoff, HP on both generators
+     CTRL_REG3 0x60 = IA1+IA2 routed to the INT1 pin
+     CTRL_REG4 0x08 = +-2g, HR            (sets the THS step to 16mg)
+     CTRL_REG5 0x0A = both interrupts latched
+     INT2_CFG  0x2A = XHIE|YHIE|ZHIE, OR
+     INT2_THS  0x19 = 25 counts = 400mg
+     INT2_DUR  0x1E = 30 counts = 300ms */
+static void HarshRegReadback(char *out, size_t len)
+{
+    snprintf(out, len, "&lisreg=%02X,%02X,%02X,%02X,%02X,%02X,%02X,%02X,%02X&i2src=%02X",
+             I2C_RdReg(0x0F),            // WHO_AM_I
+             I2C_RdReg(REG_CTRL_REG1),
+             I2C_RdReg(REG_CTRL_REG2),
+             I2C_RdReg(REG_CTRL_REG3),
+             I2C_RdReg(REG_CTRL_REG4),
+             I2C_RdReg(REG_CTRL_REG5),
+             I2C_RdReg(REG_INT2_CFG),
+             I2C_RdReg(REG_INT2_THS),
+             I2C_RdReg(REG_INT2_DURATION),
+             last_int2_src);
+}
 
 /* Called once per second from the timer tick. */
 static void HarshSpeedTick(void)
@@ -4214,7 +4252,8 @@ char XUDP_Request(char *pFilename, unsigned char pingtype)
                a ping was silently discarded here before the main loop could see
                it. Check the generator first, then leave re-initialisation to the
                throttled path in StartMainTask. */
-            if (I2C_RdReg(REG_INT2_SRC) & 0x40)
+            last_int2_src = I2C_RdReg(REG_INT2_SRC);
+            if (last_int2_src & 0x40)
                 HarshEventDetected();
             ISRstatus = I2C_RdReg(REG_INT1_SRC);   // release the pin
 #else
@@ -4646,11 +4685,15 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
            canary, and hcnt says whether detection is actually firing, which is
            the thing to check after a drive. */
         char h_part[64] = "";
+        char lis_part[64] = "";
 #ifdef ENABLE_HARSH_DRIVING
         snprintf(h_part, sizeof(h_part), "&hmin=%lu&hcnt=%lu&hraw=%lu",
                  (unsigned long)esp_get_minimum_free_heap_size(),
                  (unsigned long)harsh_event_count,
                  (unsigned long)harsh_raw_count);
+        /* 2.3.41 diagnostic - see HarshRegReadback(). Temporary: remove once
+           the cause of hraw staying 0 is identified. */
+        HarshRegReadback(lis_part, sizeof(lis_part));
 #endif
         /* Timestamp only for a live GPS fix with a sane date. Cached/cell
            positions previously carried stale (or year-2000) fix times, so
@@ -4677,7 +4720,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
             snprintf(gps_part, sizeof(gps_part), "&gpsage=%ld&gpsrec=%lu",
                      gps_age_s, (unsigned long)gnss_recover_count);
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s&fwver=" FW_VERSION,
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed / 1.852f, // OsmAnd speed param is knots
         ts_part,
@@ -4689,6 +4732,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         gps_part,
         g_part,
         h_part,
+        lis_part,
         _alarm);
     }
     Print("AT+HTTPPARA=\"URL\",\"");
@@ -7422,7 +7466,8 @@ ESP_LOGI(TAG,"Entered main task");
                one raised it. Generator 2 = harsh driving. Read this first: the
                throttled re-init below can also clear the latch.
                Bit 6 (0x40) is IA - "one or more interrupts generated". */
-            if (I2C_RdReg(REG_INT2_SRC) & 0x40)
+            last_int2_src = I2C_RdReg(REG_INT2_SRC);
+            if (last_int2_src & 0x40)
                 HarshEventDetected();
 #endif
 
