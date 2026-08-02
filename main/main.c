@@ -558,6 +558,23 @@ static bool    gnss_frozen = false;      // clock stopped advancing = receiver d
 #define GPS_FROZEN_SECONDS  120
 static int    gnss_recover_stage = 0;   // 0=none, 1=power-cycled, 2=cold-start, 3=modem reinit
 static uint32_t gnss_recover_count = 0; // recovery attempts since boot — reported as gpsrec
+
+/* No-reply detection (2.3.42) — the third variant of the stale-fix family, and
+   the one that silently disabled the fixes for the other two.
+   AT+CGPSINFO can also come back with no "+CGPSINFO:" line at all: a timeout
+   (SendATCommand returns 3) or a bare OK. XCheckGPS used to default GPSStatus
+   to 'A' and demote it only on the two literal strings "+CGPSINFO: ,," and
+   "ERROR", then do all its work inside `if (pToken != NULL)`. So a missing
+   reply was read as a valid fix AND skipped the whole body — the 2.3.40
+   frozen-clock check never evaluated, the no-fix path never zeroed fLat/fLong
+   (file-scope, so they kept their last values), and GNSSRecover() was never
+   called. live_fix stayed true, so gpsage/gpsrec were never emitted either:
+   the device reported a confident live fix that was days old and said nothing.
+   Field case 2026-08-01: the van froze at 08:24:49 NZST and resent that fix for
+   50h across 440 pings, straight through two drives, with no attribute anywhere
+   showing a fault; unit -5783 froze the same way on 07-31. Absence of evidence
+   is no longer treated as a good fix — 'V' is the default. */
+static uint32_t gnss_no_reply_count = 0; // polls with no parseable reply — reported as gpsnr
 static int    gnss_backoff_mult = 1;    // window multiplier, doubles per failed recovery, reset on fix
 
 /* A cached position older than this is worse than the cell-tower fix, which is
@@ -4714,11 +4731,16 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
            vehicle again (2.3.33). gpsage = seconds since the last real fix,
            -1 = none this session; gpsrec = recovery attempts since boot.
            Only emitted when the position is NOT a live fix, keeping healthy
-           pings unchanged. */
-        char gps_part[40] = "";
+           pings unchanged.
+           gpsnr = polls where AT+CGPSINFO returned nothing parseable (2.3.42);
+           it was this case being misread as a valid fix that hid the 50h freeze
+           of 2026-08-01, so it now has to be visible in telemetry rather than
+           only findable by reading the source. */
+        char gps_part[72] = "";
         if (!live_fix)
-            snprintf(gps_part, sizeof(gps_part), "&gpsage=%ld&gpsrec=%lu",
-                     gps_age_s, (unsigned long)gnss_recover_count);
+            snprintf(gps_part, sizeof(gps_part), "&gpsage=%ld&gpsrec=%lu&gpsnr=%lu",
+                     gps_age_s, (unsigned long)gnss_recover_count,
+                     (unsigned long)gnss_no_reply_count);
         snprintf(str, sizeof(str),
             "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
@@ -5624,9 +5646,10 @@ void XCheckGPS(void)
 {
     char *pToken;
     float tfSpeed=0;
+    unsigned char at_rc;
     // char *pData; // TBD
 
-    SendATCommand("AT+CGPSINFO\r\n","OK","ERROR",3);
+    at_rc = SendATCommand("AT+CGPSINFO\r\n","OK","ERROR",3);
     osDelay(500);
     //VALTRACK-V4-VTS: AT+CGPSINFO
 //+CGPSINFO: ,,,,,,,,
@@ -5640,15 +5663,28 @@ void XCheckGPS(void)
     //     GPSStatus = 'V';
     // else
     //     GPSStatus = 'A';
-    GPSStatus = 'A'; // Necessary as CGPS info doesnt return GPSStatus=A or V. 
-    if(MapForward(Buff2,BUFF2_SIZE,(char*)"+CGPSINFO: ,,",13) != NULL)
-        GPSStatus = 'V';
-    else if(MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) != NULL)
-        GPSStatus = 'V';
+    pToken = MapForward(Buff2,BUFF2_SIZE,(char*)"+CGPSINFO:",10);
+
+    /* CGPSINFO carries no A/V field, so status is inferred. Inverted in 2.3.42:
+       'V' is the default and a fix must be positively proven, rather than 'A'
+       being assumed and demoted only by two known-bad strings. A timeout or a
+       reply with no "+CGPSINFO:" line now reads as no-fix instead of as a valid
+       one - see gnss_no_reply_count. */
+    GPSStatus = 'V';
+    if(pToken != NULL && at_rc != 3 &&
+       MapForward(Buff2,BUFF2_SIZE,(char*)"+CGPSINFO: ,,",13) == NULL &&
+       MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) == NULL)
+        GPSStatus = 'A';
+
+    if(pToken == NULL || at_rc == 3)
+        gnss_no_reply_count++;
 
     UpdateLocation(GPSStatus);
 
-    pToken = MapForward(Buff2,BUFF2_SIZE,(char*)"+CGPSINFO:",10);
+    /* Parse only when there is something to parse. Everything after this block
+       runs unconditionally (2.3.42) - it used to be nested inside the
+       pToken != NULL test, which is what let a missing reply bypass the
+       frozen-clock check, the no-fix zeroing and GNSS recovery all at once. */
     if(pToken != NULL)
     {
         unsigned char in = 0;
@@ -5667,7 +5703,8 @@ void XCheckGPS(void)
            nothing, and the block below zeroes these anyway. */
         sscanf( (void*)GPSDate, "%2d%2d%2d", (int*)&GPSDay,(int*)&GPSMonth,(int*)&GPSYear);
         sscanf( (void*)GPSTime, "%2d%2d%2d", (int*)&GPSHours,(int*)&GPSMinutes,(int*)&GPSSeconds);
-
+    }
+    {
         /* Frozen-clock check. The modem can keep answering with a well-formed
            sentence whose contents never change - a stale fix that looks
            completely valid. A working receiver stamps every poll with current
