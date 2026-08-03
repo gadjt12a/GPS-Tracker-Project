@@ -575,6 +575,7 @@ static uint32_t gnss_recover_count = 0; // recovery attempts since boot — repo
    showing a fault; unit -5783 froze the same way on 07-31. Absence of evidence
    is no longer treated as a good fix — 'V' is the default. */
 static uint32_t gnss_no_reply_count = 0; // polls with no parseable reply — reported as gpsnr
+static int64_t gnss_no_reply_since_us = 0; // start of the current no-reply run; 0 = modem answering
 static int    gnss_backoff_mult = 1;    // window multiplier, doubles per failed recovery, reset on fix
 
 /* A cached position older than this is worse than the cell-tower fix, which is
@@ -5775,8 +5776,25 @@ void XCheckGPS(void)
        MapForward(Buff2,BUFF2_SIZE,(char*)"ERROR",5) == NULL)
         GPSStatus = 'A';
 
+    /* Track how long the no-reply run has lasted (2.3.45), not just how many
+       there have been. Field case 2026-08-04: the van sat on gpsnr=7938 and
+       gpsage=34580 (9.6h with no fix) while gpsrec stayed 0 - the recovery
+       ladder never fired once, because a no-reply does not set gnss_frozen and
+       so never cleared the parked gate below. 2.3.42 made this failure visible
+       but not self-healing; the receiver would have stayed dead until the next
+       drive. Time-based rather than count-based so it does not depend on how
+       often XCheckGPS happens to run, and it reuses GPS_FROZEN_SECONDS so both
+       unambiguous-failure paths share one constant. */
     if(pToken == NULL || at_rc == 3)
+    {
         gnss_no_reply_count++;
+        if (gnss_no_reply_since_us == 0)
+            gnss_no_reply_since_us = esp_timer_get_time();
+    }
+    else
+    {
+        gnss_no_reply_since_us = 0;   // modem is answering again
+    }
 
     UpdateLocation(GPSStatus);
 
@@ -5878,8 +5896,22 @@ void XCheckGPS(void)
                is broken, and it will stay broken until something restarts it.
                Waiting for the next drive would mean the fault persists through
                it - exactly what happened on 2026-07-30, where the freeze began
-               while parked and the whole morning commute went unrecorded. */
-            bool gnss_active = ign_on || (MotionTimer <= 60) || gnss_frozen;
+               while parked and the whole morning commute went unrecorded.
+
+               A sustained no-reply run is equally unambiguous and now bypasses
+               it too (2.3.45). A modem that has not returned a parseable
+               +CGPSINFO for GPS_FROZEN_SECONDS is not a vehicle under a carport
+               - sky view has nothing to do with whether the AT command answers.
+               Field case 2026-08-04: van on gpsnr=7938, gpsage=34580 (9.6h with
+               no fix), gpsrec=0 - the ladder never fired once, because a
+               no-reply leaves gnss_frozen false and the gate held. 2.3.42 made
+               that failure visible; this makes it self-healing. */
+            bool gnss_no_reply_dead =
+                (gnss_no_reply_since_us != 0 &&
+                 esp_timer_get_time() - gnss_no_reply_since_us >
+                     (int64_t)GPS_FROZEN_SECONDS * 1000000LL);
+            bool gnss_active = ign_on || (MotionTimer <= 60)
+                               || gnss_frozen || gnss_no_reply_dead;
             int64_t window_s = (last_fix_us != 0)
                 ? GNSS_RECOVER_AFTER_S : GNSS_COLDSTART_GRACE_S;
             window_s *= gnss_backoff_mult;
