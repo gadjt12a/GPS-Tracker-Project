@@ -4769,8 +4769,23 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
             snprintf(gps_part, sizeof(gps_part), "&gpsage=%ld&gpsrec=%lu&gpsnr=%lu",
                      gps_age_s, (unsigned long)gnss_recover_count,
                      (unsigned long)gnss_no_reply_count);
+        /* Periodic-OTA visibility. The 24h check at the bottom of StartMainTask
+           fires on ota_check_timer >= 86400, but "up to date" is indistinguishable
+           from "never ran" - both are silent - so a 2026-07-17 note claiming the
+           periodic check does not fire has sat unresolved for ~20 versions with
+           no way to test it. Static reading cleared all three suspects (the tick
+           runs in its own task and keeps 0.3% time; the main-task trap at 7435 is
+           inside #ifndef VALTRACK_V4_VTS and so compiled out; the check sits at
+           the top level of the main loop), which means the note may simply be
+           stale - but four wrong harsh-driving theories say measure, do not argue.
+           Reporting the counter makes it observable: watch it climb, cross 86400
+           and reset. Comparing it against uptime on the same ping also detects any
+           tick under-count for free, since the two should track. Temporary -
+           remove once the periodic path is confirmed either way. */
+        char ota_part[24] = "";
+        snprintf(ota_part, sizeof(ota_part), "&otat=%lu", (unsigned long)ota_check_timer);
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s&fwver=" FW_VERSION,
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed / 1.852f, // OsmAnd speed param is knots
         ts_part,
@@ -4783,6 +4798,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         g_part,
         h_part,
         lis_part,
+        ota_part,
         _alarm);
     }
     Print("AT+HTTPPARA=\"URL\",\"");
