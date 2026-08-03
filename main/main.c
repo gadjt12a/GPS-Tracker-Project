@@ -4781,10 +4781,20 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
            "polling constantly, never fires" from "polled once, never again".
            They immediately found the cause: ipoll ~1 per 11 min (not ~1Hz) and
            qpoll exactly 0 (dead XUDP_Request path).
-           apoll (2.3.44) counts InitAccelerometer's now-checked INT2_SRC read,
-           which is the fix - it should climb at roughly uptime/60 and is the
-           fastest poll in the system. If hraw is still 0 while apoll is large,
-           the sensor genuinely is not triggering and the threshold is next. */
+           apoll (2.3.44) counts InitAccelerometer's now-checked INT2_SRC read.
+           NOTE: it does NOT climb at uptime/60. The throttled re-init lives
+           inside the same `if(INT1 == 0)` block as ipoll, so 60s is a ceiling
+           on how often it re-inits WHEN the pin fires, not a poll rate - it
+           inherits ipoll's ~1-per-11-min. Measured 2026-08-04: apoll stuck at 2
+           (the two boot-path calls) after 20 min parked with ipoll=0.
+
+           That does not weaken the fix. What matters is that no unchecked
+           INT2_SRC read remains anywhere (this site, InitAccelerometer, and the
+           dead XUDP_Request one all test bit 6 first), so a latched event
+           survives until something counts it. Poll rate now sets reporting
+           latency, not whether detection works.
+           If hraw is still 0 after a drive where ipoll clearly climbed, the
+           sensor genuinely is not triggering and the threshold is next. */
         snprintf(h_part, sizeof(h_part), "&hmin=%lu&hcnt=%lu&hraw=%lu&ipoll=%lu&qpoll=%lu&apoll=%lu",
                  (unsigned long)esp_get_minimum_free_heap_size(),
                  (unsigned long)harsh_event_count,
