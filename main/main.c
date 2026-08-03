@@ -1485,6 +1485,29 @@ static uint32_t harsh_raw_count = 0;     // reported as hraw
    register rather than just the result of testing bit 6. 0xFF = never read. */
 static unsigned char last_int2_src = 0xFF;
 
+/* Poll-rate counters (2.3.43).
+   i2src has read a constant 0x15 on every ping from both units, which is
+   consistent with two very different worlds and cannot distinguish them:
+     (a) the poll runs constantly and generator 2 genuinely never fires, or
+     (b) the poll ran once early and has not run since, so 0x15 is a fossil.
+   last_int2_src starts at 0xFF, so observing 0x15 proves only that it was
+   updated AT LEAST ONCE. A constant value says nothing about frequency.
+
+   Both sites that read INT2_SRC now count their executions, and they are kept
+   separate because they answer different questions:
+     ipoll - the StartMainTask INT1 handler, which runs only when the INT1 pin
+             is asserted. Frozen here means nothing is asserting or servicing
+             the pin at all, which would also mean motion wake is broken - a
+             far bigger finding than a threshold being wrong, and it would make
+             a threshold bisection meaningless.
+     qpoll - the XHTTP_Request ping wait loop, which runs every ~30s while
+             driving regardless of the pin. This is the control: it should
+             always climb, so if qpoll moves and ipoll does not, the fault is
+             the pin, not the code path.
+   Measurement before theory - four inferred mechanisms have now been wrong. */
+static uint32_t int1_poll_count = 0;     // reported as ipoll
+static uint32_t ping_poll_count = 0;     // reported as qpoll
+
 /* Diagnostic readback (2.3.41). Three fix attempts for "harsh detection never
    fires" have now failed - stack/heap/I2C (2.3.35), HPF cutoff (2.3.38), and
    InitAccelerometer resetting the generator state (2.3.39) - each based on an
@@ -4269,6 +4292,7 @@ char XUDP_Request(char *pFilename, unsigned char pingtype)
                a ping was silently discarded here before the main loop could see
                it. Check the generator first, then leave re-initialisation to the
                throttled path in StartMainTask. */
+            ping_poll_count++;                     // qpoll - see 2.3.43 note
             last_int2_src = I2C_RdReg(REG_INT2_SRC);
             if (last_int2_src & 0x40)
                 HarshEventDetected();
@@ -4701,13 +4725,17 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
            What remains is worth keeping: hmin is a general leak/fragmentation
            canary, and hcnt says whether detection is actually firing, which is
            the thing to check after a drive. */
-        char h_part[64] = "";
+        char h_part[112] = "";
         char lis_part[64] = "";
 #ifdef ENABLE_HARSH_DRIVING
-        snprintf(h_part, sizeof(h_part), "&hmin=%lu&hcnt=%lu&hraw=%lu",
+        /* ipoll/qpoll added in 2.3.43 - a constant i2src cannot distinguish
+           "polling constantly, never fires" from "polled once, never again". */
+        snprintf(h_part, sizeof(h_part), "&hmin=%lu&hcnt=%lu&hraw=%lu&ipoll=%lu&qpoll=%lu",
                  (unsigned long)esp_get_minimum_free_heap_size(),
                  (unsigned long)harsh_event_count,
-                 (unsigned long)harsh_raw_count);
+                 (unsigned long)harsh_raw_count,
+                 (unsigned long)int1_poll_count,
+                 (unsigned long)ping_poll_count);
         /* 2.3.41 diagnostic - see HarshRegReadback(). Temporary: remove once
            the cause of hraw staying 0 is identified. */
         HarshRegReadback(lis_part, sizeof(lis_part));
@@ -7503,6 +7531,7 @@ ESP_LOGI(TAG,"Entered main task");
                one raised it. Generator 2 = harsh driving. Read this first: the
                throttled re-init below can also clear the latch.
                Bit 6 (0x40) is IA - "one or more interrupts generated". */
+            int1_poll_count++;                     // ipoll - see 2.3.43 note
             last_int2_src = I2C_RdReg(REG_INT2_SRC);
             if (last_int2_src & 0x40)
                 HarshEventDetected();
