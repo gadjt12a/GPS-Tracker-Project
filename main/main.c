@@ -933,6 +933,15 @@ typedef enum SensorTypes
 }SensorType;
 SensorType MotionSensor = NOT_DETECTED;
 unsigned char VALREAD=0;
+/* Forward declarations (2.3.44). The harsh statics and HarshEventDetected live
+   below this function, but InitAccelerometer now has to check for a pending
+   event before it clobbers the generator - see the INT2_SRC block near the end. */
+#ifdef ENABLE_HARSH_DRIVING
+static void HarshEventDetected(void);
+static uint32_t accel_poll_count = 0;   // reported as apoll
+static unsigned char harsh_armed = 0;   // generator 2 configured at least once
+#endif
+
 void InitAccelerometer_LIS3D(void)
 {
      unsigned char i;
@@ -1003,9 +1012,16 @@ void InitAccelerometer_LIS3D(void)
        physical INT1 pin. Only one interrupt line is wired to the ESP32, so both
        share it and INT1_SRC/INT2_SRC are read to tell them apart. */
     I2C_WrReg(REG_CTRL_REG3, 0x60);
-    /* 0x0A: latch both (LIR_INT1 | LIR_INT2). Latching is what makes the ~1Hz
-       poll in StartMainTask safe - a 300ms event holds the pin until its SRC
-       register is read, so it cannot be missed between polls. */
+    /* 0x0A: latch both (LIR_INT1 | LIR_INT2). Latching is what makes a slow poll
+       safe - a 300ms event holds the pin until its SRC register is read, so it
+       cannot be missed between polls however far apart they are.
+
+       This comment used to say "the ~1Hz poll in StartMainTask". That rate was
+       never measured and is wrong by a factor of ~650: the 2.3.43 counters put
+       it at one poll every ~11 minutes on the driven van. Latching still saves
+       us, but ONLY because nothing clears the latch without checking it first -
+       which was not true until 2.3.44. Do not reintroduce a blind INT2_SRC
+       read anywhere. */
     I2C_WrReg(REG_CTRL_REG5, 0x0A);
 #else
     I2C_WrReg(REG_CTRL_REG2, 0x05);
@@ -1025,10 +1041,36 @@ void InitAccelerometer_LIS3D(void)
     /* Generator 2 = harsh driving, entirely in hardware. THS/DURATION are
        derived from HARSH_EVENT_G / HARSH_EVENT_MS in SCI.h. INT2_CFG 0x2A is
        XHIE|YHIE|ZHIE with OR combination, so an excursion on any axis fires. */
+    /* THE FIX (2.3.44). This used to end with a blind `I2C_RdReg(REG_INT2_SRC);
+       // clear latch` - and that single line is why hraw stayed 0 for six
+       versions.
+
+       Measured 2026-08-04 with the 2.3.43 counters: the StartMainTask INT1 poll
+       runs about ONCE EVERY 11 MINUTES on the driven van (ipoll=98 over 17.9h
+       including a drive at 82 km/h), not the ~1Hz every comment in this file
+       claimed. This function is throttled to every 60 seconds. So the latch was
+       being destroyed 11 times for every time anything looked at it - a harsh
+       event was latched, then wiped long before the poll came round.
+
+       Reading INT2_SRC is itself what clears the latch, so the read has to
+       happen BEFORE the generator is rewritten and its result has to be acted
+       on rather than discarded. That turns this function from the thing that
+       destroyed events into the fastest poll in the system (60s), and because
+       the interrupt is latched, a 60s poll cannot miss anything - the rate now
+       only affects reporting latency, not detection.
+
+       harsh_armed suppresses the very first call, where INT2_SRC holds whatever
+       the sensor powered up with rather than a real event. */
+    {
+        unsigned char pending = I2C_RdReg(REG_INT2_SRC);   // read == clear latch
+        accel_poll_count++;
+        if (harsh_armed && (pending & 0x40))
+            HarshEventDetected();
+    }
     I2C_WrReg(REG_INT2_THS, HARSH_THS_COUNTS);
     I2C_WrReg(REG_INT2_DURATION, HARSH_DUR_COUNTS);
     I2C_WrReg(REG_INT2_CFG, 0x2A);
-    I2C_RdReg(REG_INT2_SRC); // clear latch
+    harsh_armed = 1;
 #endif
 
     /* The debug sweep that used to live here - reading every register 0x07-0x3F
@@ -4286,12 +4328,18 @@ char XUDP_Request(char *pFilename, unsigned char pingtype)
 //            InitAccelerometer_mma84();
 //            #endif
 #ifdef ENABLE_HARSH_DRIVING
-            /* This runs inside the ping wait loop, i.e. every 30s while driving.
-               Before 2.3.39 it called InitAccelerometer() unconditionally, whose
-               register sweep cleared INT2_SRC - so any harsh event latched during
-               a ping was silently discarded here before the main loop could see
-               it. Check the generator first, then leave re-initialisation to the
-               throttled path in StartMainTask. */
+            /* DEAD CODE - this is XUDP_Request, not XHTTP_Request (2.3.44).
+               OsmAnd pings go through XHTTP_Request (line ~4474+), which never
+               touches the accelerometer at all. XUDP_Request is the legacy UDP
+               path and is not on the ping route, which is why qpoll measured
+               exactly 0 on all three units including the driven van.
+
+               So 2.3.39's "XHTTP_Request's wait loop no longer clears INT2_SRC
+               without checking it (it ran every 30s while driving)" was applied
+               to the wrong function - it patched code that never runs. Left in
+               place and correct-by-inspection rather than deleted, so that if
+               this path is ever revived it does not resurrect the old bug.
+               qpoll is retained as the standing proof that it stays dead. */
             ping_poll_count++;                     // qpoll - see 2.3.43 note
             last_int2_src = I2C_RdReg(REG_INT2_SRC);
             if (last_int2_src & 0x40)
@@ -4725,17 +4773,24 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
            What remains is worth keeping: hmin is a general leak/fragmentation
            canary, and hcnt says whether detection is actually firing, which is
            the thing to check after a drive. */
-        char h_part[112] = "";
+        char h_part[160] = "";
         char lis_part[64] = "";
 #ifdef ENABLE_HARSH_DRIVING
         /* ipoll/qpoll added in 2.3.43 - a constant i2src cannot distinguish
-           "polling constantly, never fires" from "polled once, never again". */
-        snprintf(h_part, sizeof(h_part), "&hmin=%lu&hcnt=%lu&hraw=%lu&ipoll=%lu&qpoll=%lu",
+           "polling constantly, never fires" from "polled once, never again".
+           They immediately found the cause: ipoll ~1 per 11 min (not ~1Hz) and
+           qpoll exactly 0 (dead XUDP_Request path).
+           apoll (2.3.44) counts InitAccelerometer's now-checked INT2_SRC read,
+           which is the fix - it should climb at roughly uptime/60 and is the
+           fastest poll in the system. If hraw is still 0 while apoll is large,
+           the sensor genuinely is not triggering and the threshold is next. */
+        snprintf(h_part, sizeof(h_part), "&hmin=%lu&hcnt=%lu&hraw=%lu&ipoll=%lu&qpoll=%lu&apoll=%lu",
                  (unsigned long)esp_get_minimum_free_heap_size(),
                  (unsigned long)harsh_event_count,
                  (unsigned long)harsh_raw_count,
                  (unsigned long)int1_poll_count,
-                 (unsigned long)ping_poll_count);
+                 (unsigned long)ping_poll_count,
+                 (unsigned long)accel_poll_count);
         /* 2.3.41 diagnostic - see HarshRegReadback(). Temporary: remove once
            the cause of hraw staying 0 is identified. */
         HarshRegReadback(lis_part, sizeof(lis_part));
