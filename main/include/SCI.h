@@ -242,8 +242,40 @@ extern const char *TAG;
 // touched only when something actually happens.
 // ---------------------------------------------------------------------------
 #define ENABLE_HARSH_DRIVING
-#define HARSH_EVENT_G       0.40f   // sustained horizontal accel = harsh event
-#define HARSH_EVENT_MS      300     // must stay above threshold this long
+/* ============================================================================
+   DIAGNOSTIC BUILD - branch diag/harsh-bisect. DO NOT PUBLISH TO THE OTA SERVER.
+   ============================================================================
+   Production values are 0.40f / 300. They are lowered here to the most
+   permissive setting the sensor supports, to answer one binary question:
+   does the LIS3DH interrupt path produce hraw > 0 under ANY stimulus?
+
+   Justification (2026-08-05): a real test drive - hard braking 76.9->7.6 km/h,
+   hard L/R/L cornering, and a judder bar at 50 km/h - produced hraw=0 while
+   ipoll climbed 92->132 (40 INT1 assertions in 4 minutes) and apoll advanced 4
+   times. So the sensor was polled constantly throughout and generator 2 never
+   fired. Config was verified correct by register readback in 2.3.41, and 2.3.44
+   removed the last unchecked INT2_SRC read. Everything except the sensor itself
+   has now been eliminated.
+
+   At 32mg / 20ms a hand shake is orders of magnitude above threshold:
+     hraw > 0  -> the path works; this is pure calibration, and 400mg/300ms is
+                  simply too strict for real driving. Suspect DURATION first -
+                  30 consecutive samples ALL above threshold at 100Hz is a hard
+                  ask when braking ramps and road vibration dithers the signal.
+     hraw = 0  -> something structural: INT1 wiring, generator 2 routing, or the
+                  chip. Not a tuning problem.
+
+   FW_VERSION is deliberately left at the production value so the OTA check
+   (plain strcmp) sees no difference and the unit will NOT self-revert.
+   Telemetry tells the builds apart for free: lisreg reports INT2_THS and
+   INT2_DURATION as its 8th and 9th bytes, so this build reads
+     33,57,B7,60,08,0A,2A,02,02
+   against production's
+     33,57,B7,60,08,0A,2A,19,1E
+   BENCH UNITS ONLY - at 32mg the van would fire hcnt constantly and spam harsh
+   alarms into the live trial. */
+#define HARSH_EVENT_G       0.032f  // DIAG (prod 0.40f) - 2 counts x 16mg = 32mg
+#define HARSH_EVENT_MS      20      // DIAG (prod 300)   - 2 counts x 10ms = 20ms
 #define HARSH_RESET_G       0.25f   // re-arm only after accel drops below this
 #define HARSH_ACCIDENT_G    1.85f   // near-clip spike = accident (stage 2, see below)
 #define HARSH_HOLDOFF_S     15      // min gap between harsh alarms
