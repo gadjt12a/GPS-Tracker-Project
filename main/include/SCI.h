@@ -242,8 +242,31 @@ extern const char *TAG;
 // touched only when something actually happens.
 // ---------------------------------------------------------------------------
 #define ENABLE_HARSH_DRIVING
+/* 2.3.46 calibration - ONE VARIABLE AT A TIME.
+   The bench bisection on 2026-08-05 settled it: nothing is broken, the defaults
+   were simply too strict. A diagnostic build at 32mg/20ms (branch
+   diag/harsh-bisect) flashed to unit 2 produced hraw 0 -> 5 from a 10-second
+   hand shake, with i2src=0x65/0x66 - IA set, ZH and XH events. So generator 2
+   fires, the pin asserts, the poll reads it and HarshEventDetected() runs. The
+   whole chain is good.
+
+   That test moved BOTH parameters, so it does not say which one mattered. This
+   release changes only the duration and leaves the threshold alone.
+
+   Duration is the prime suspect. 300ms at 100Hz ODR means 30 CONSECUTIVE
+   samples all above threshold; a single sample dipping below resets the
+   counter. Real braking ramps up and down and road vibration dithers the
+   signal through the high-pass filter, so an unbroken 300ms plateau may
+   essentially never occur - which matches the field evidence: a genuine test
+   drive on 2026-08-05 (hard braking 76.9->7.6 km/h, hard L/R/L cornering, a
+   judder bar at 50 km/h) produced hraw=0 while ipoll climbed 92->132, i.e. the
+   sensor was polled throughout and simply never triggered.
+
+   0.40g itself is defensible and stays: DOT calls 0.45g harsh, Verizon Connect
+   uses 0.265g braking / 0.220g acceleration. If hraw stays 0 after a hard-brake
+   run on this build, lower HARSH_EVENT_G next - still one variable at a time. */
 #define HARSH_EVENT_G       0.40f   // sustained horizontal accel = harsh event
-#define HARSH_EVENT_MS      300     // must stay above threshold this long
+#define HARSH_EVENT_MS      100     // 2.3.46: was 300 (30 consecutive samples - never met in the field)
 #define HARSH_RESET_G       0.25f   // re-arm only after accel drops below this
 #define HARSH_ACCIDENT_G    1.85f   // near-clip spike = accident (stage 2, see below)
 #define HARSH_HOLDOFF_S     15      // min gap between harsh alarms
@@ -271,7 +294,7 @@ extern const char *TAG;
    livelock. See ISSUES.md K1. */
 
 // OTA firmware update
-#define FW_VERSION          "2.3.45"
+#define FW_VERSION          "2.3.46"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096
