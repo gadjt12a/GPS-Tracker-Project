@@ -1041,7 +1041,28 @@ void InitAccelerometer_LIS3D(void)
 #ifdef ENABLE_HARSH_DRIVING
     /* Generator 2 = harsh driving, entirely in hardware. THS/DURATION are
        derived from HARSH_EVENT_G / HARSH_EVENT_MS in SCI.h. INT2_CFG 0x2A is
-       XHIE|YHIE|ZHIE with OR combination, so an excursion on any axis fires. */
+       XHIE|YHIE|ZHIE with OR combination.
+
+       DIAGNOSTIC (branch diag/harsh-bidir): 0x2A -> 0x3F. DO NOT PUBLISH until
+       the bench confirms it.
+
+       0x2A enables only the HIGH side of each axis. In the LIS3DH, XH fires on
+       (axis > +THS); the low bits (XL 0x01, YL 0x04, ZL 0x10) are what fire on
+       (axis < -THS), and they were disabled. With the high-pass filter on, the
+       signal is centred on zero, so an excursion is positive on some axes and
+       negative on others depending on direction and on how the unit happens to
+       be bolted into the vehicle. Any event whose components are all negative
+       could never fire, at ANY threshold. The old comment claiming "an excursion
+       on any axis fires" was wrong - it was any POSITIVE excursion.
+
+       Fits the bench evidence 2026-08-05: at 32mg/20ms it fired readily
+       (i2src 0x65/0x66 - both high-side bits), because oscillatory shaking
+       crosses +32mg on some axis constantly. At 400mg/100ms neither a hard
+       shake nor sharp 90-degree flips produced anything (i2src 0x15/0x25,
+       IA clear), which needs a sustained POSITIVE excursion on one axis.
+
+       0x3F = XL|XH|YL|YH|ZL|ZH, OR. Direction-agnostic, which is what harsh
+       detection needs given firmware cannot know the mounting orientation. */
     /* THE FIX (2.3.44). This used to end with a blind `I2C_RdReg(REG_INT2_SRC);
        // clear latch` - and that single line is why hraw stayed 0 for six
        versions.
@@ -1070,7 +1091,7 @@ void InitAccelerometer_LIS3D(void)
     }
     I2C_WrReg(REG_INT2_THS, HARSH_THS_COUNTS);
     I2C_WrReg(REG_INT2_DURATION, HARSH_DUR_COUNTS);
-    I2C_WrReg(REG_INT2_CFG, 0x2A);
+    I2C_WrReg(REG_INT2_CFG, 0x3F);   // DIAG: was 0x2A (high-side only)
     harsh_armed = 1;
 #endif
 
