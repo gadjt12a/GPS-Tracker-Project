@@ -264,10 +264,20 @@ extern const char *TAG;
 
    0.40g itself is defensible and stays: DOT calls 0.45g harsh, Verizon Connect
    uses 0.265g braking / 0.220g acceleration. If hraw stays 0 after a hard-brake
-   run on this build, lower HARSH_EVENT_G next - still one variable at a time. */
-#define HARSH_EVENT_G       0.40f   // sustained horizontal accel = harsh event
+   run on this build, lower HARSH_EVENT_G next - still one variable at a time.
+
+   2.3.47: that hard-brake run happened (2026-08-06 12:37-12:43 NZST, three
+   deliberate stops) and hraw stayed 0 with ipoll climbing 191->233, so the
+   sensor was polled throughout and never triggered at 0.40g/100ms. Traccar
+   positions give the decelerations: 47.8->15.7, 68.2->36.7 and 70.9->42.8 km/h,
+   i.e. 0.227g, 0.223g and 0.199g. Those are averages over a 4s sampling window
+   so the true peaks are higher, but they put real braking on this vehicle in
+   the 0.2-0.3g band, not above 0.4g. Threshold drops to 0.25g - which is also
+   almost exactly Verizon Connect's 0.265g braking figure. Duration stays at
+   100ms so this remains one variable. */
+#define HARSH_EVENT_G       0.25f   // 2.3.47: was 0.40 (never triggered on real hard braking)
 #define HARSH_EVENT_MS      100     // 2.3.46: was 300 (30 consecutive samples - never met in the field)
-#define HARSH_RESET_G       0.25f   // re-arm only after accel drops below this
+#define HARSH_RESET_G       0.25f   // UNUSED - leftover from the pre-2.3.37 software sampler
 #define HARSH_ACCIDENT_G    1.85f   // near-clip spike = accident (stage 2, see below)
 #define HARSH_HOLDOFF_S     15      // min gap between harsh alarms
 #define HARSH_SPEED_DELTA   6.0f    // km/h change over 2s that classifies braking/accel vs cornering
@@ -277,7 +287,7 @@ extern const char *TAG;
    never drift apart.
      THS  LSB = 16mg   at +-2g full scale (CTRL_REG4 = 0x08)
      DUR  LSB = 1/ODR  = 10ms at 100Hz    (CTRL_REG1 = 0x57)
-   0.40g -> 25 counts, 300ms -> 30 counts. Both well inside the 7-bit fields. */
+   0.25g -> 15 counts, 100ms -> 10 counts. Both well inside the 7-bit fields. */
 #define LIS3DH_ODR_HZ            100
 #define LIS3DH_THS_MG_PER_LSB    16
 #define HARSH_THS_COUNTS   ((unsigned char)((HARSH_EVENT_G * 1000.0f) / LIS3DH_THS_MG_PER_LSB))
@@ -294,7 +304,7 @@ extern const char *TAG;
    livelock. See ISSUES.md K1. */
 
 // OTA firmware update
-#define FW_VERSION          "2.3.46"
+#define FW_VERSION          "2.3.47"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096

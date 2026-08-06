@@ -599,7 +599,22 @@ static int    gnss_backoff_mult = 1;    // window multiplier, doubles per failed
 /* 1-second GPS track buffer. Samples recorded while moving; drained as a
    batch inside the ping HTTP session so track resolution is 1s while the
    radio only does full session setup once per ping interval.
-   Single producer (timer task) / single consumer (main task) ring. */
+   Single producer (timer task) / single consumer (main task) ring.
+
+   2.3.47 - the "1s" above was aspiration, not fact. Measured on the van
+   (2026-08-06 drive, sample timestamps straight out of the Traccar log):
+   4-5s apart within a burst and 11-21s across ping boundaries, averaging
+   ~4.6s. TrackSampleTick() does run at 1Hz, but it discards every tick where
+   the GPS second has not advanced - and the GPS second only advances when
+   XCheckGPS() polls the modem, which happens once per main-loop pass. So the
+   real sampling interval is the main-loop period, and that is dominated by
+   fixed osDelay()s in the AT helpers rather than by anything GNSS-related.
+   See the CheckNetwork throttle in the main loop for the fix.
+
+   tqd/tdrp exist to answer the question that opens up next: if sampling gets
+   faster than the drain can deliver (one HTTPPARA + HTTPACTION round trip per
+   sample), the buffer backs up and then silently overwrites. Measure before
+   pushing the rate any further. */
 #define TRACK_SAMPLE_SECONDS 1
 #define TRACK_BUF_SIZE       256  // ~4 min of moving data if sends fail
 typedef struct {
@@ -612,6 +627,7 @@ static float track_last_lat = 0.0f, track_last_lon = 0.0f;
 static float track_live_speed_kmh = 0.0f; // latest track-derived speed; live ping reports it
 static int64_t track_live_speed_us = 0;   // esp_timer time of that sample
 static long track_prev_ts = 0;            // GPS unix ts of previous recorded sample
+static unsigned long track_drop_count = 0; // samples lost to buffer wrap (tdrp)
 static long osmand_unix_ts(int yy, int mo, int dd, int hh, int mi, int ss);
 
 /* Ignition + external-power sensing from the main supply voltage (VCHG ADC).
@@ -1434,7 +1450,10 @@ static void TrackSampleTick(void)
 
     unsigned short next = (track_tail + 1) % TRACK_BUF_SIZE;
     if (next == track_head)
+    {
         track_head = (track_head + 1) % TRACK_BUF_SIZE; // full — drop oldest
+        track_drop_count++;                             // reported as tdrp
+    }
 
     TrackSample *s = &track_buf[track_tail];
     s->lat = lat;
@@ -4850,8 +4869,23 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
            remove once the periodic path is confirmed either way. */
         char ota_part[24] = "";
         snprintf(ota_part, sizeof(ota_part), "&otat=%lu", (unsigned long)ota_check_timer);
+
+        /* Track-buffer health (2.3.47). tqd is the queue depth at ping time -
+           i.e. samples recorded but not yet delivered - and tdrp is the running
+           count lost to buffer wrap. Both read at the top of the ping, BEFORE
+           the drain loop below empties it, so tqd is the backlog the drain is
+           about to face rather than whatever is left afterwards.
+           tqd ~0 and tdrp 0 means delivery is keeping up and the sample rate
+           can safely go higher. tqd climbing during a drive means the ceiling
+           is the per-sample HTTP round trip, and the fix is fewer/fatter
+           requests, not a faster sampler. */
+        char trk_part[32] = "";
+        snprintf(trk_part, sizeof(trk_part), "&tqd=%u&tdrp=%lu",
+                 (unsigned)((track_tail - track_head + TRACK_BUF_SIZE) % TRACK_BUF_SIZE),
+                 (unsigned long)track_drop_count);
+
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s%s&fwver=" FW_VERSION,
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed / 1.852f, // OsmAnd speed param is knots
         ts_part,
@@ -4864,6 +4898,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         g_part,
         h_part,
         lis_part,
+        trk_part,
         ota_part,
         _alarm);
     }
@@ -8346,13 +8381,43 @@ ESP_LOGI(TAG,"Entered main task");
 //            GSMResetTimer = 0;
 //        }        
         // #ifdef VALTRACK_V4_VTS // No need to check and exit sleep mode of GSM for V4MF-MU
-        if(CheckNetwork()==1)
+
+        /* 2.3.47 - throttle the registration check while GNSS is live.
+           CheckNetwork() costs osDelay(1000) on entry plus osDelay(500) after
+           the CREG reply, so calling it every pass put ~1.5s of pure sleep into
+           a loop whose period IS the GPS track sampling interval (XCheckGPS()
+           below runs once per pass). Measured effect on the van: track samples
+           4-5s apart instead of the intended 1s.
+
+           Registration state does not change second to second, so 30s is ample.
+           When GNSS is NOT live we fall back to checking every pass: that is
+           the state where a network fault is the likely cause and where track
+           resolution does not matter anyway.
+
+           Safe to skip because the call is side-effect free - it returns
+           registration status and UpdateNetwork() only sets the status LED.
+           Nothing in the network-loss auto-restart path depends on it. */
         {
-            UpdateNetwork(0);
-        }
-        else
-        {
-            UpdateNetwork(1);
+            static int64_t last_net_check_us = 0;
+            static unsigned char last_net_state = 1;
+            int64_t now_us = esp_timer_get_time();
+
+            if (GPSStatus != 'A' ||
+                last_net_check_us == 0 ||
+                now_us - last_net_check_us >= 30LL * 1000000LL)
+            {
+                last_net_state = CheckNetwork();
+                last_net_check_us = now_us;
+            }
+
+            if(last_net_state == 1)
+            {
+                UpdateNetwork(0);
+            }
+            else
+            {
+                UpdateNetwork(1);
+            }
         }
         #ifdef EXT_ANT_ENABLED
             XCheckGPS();
