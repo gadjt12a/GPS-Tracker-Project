@@ -995,7 +995,10 @@ void InitAccelerometer_LIS3D(void)
        it reset the high-pass filter on every call. HPM=10 below now makes that
        harmless anyway, but there is no reason to do it. */
     VALREAD = I2C_RdReg(0x0F);//VALREAD = I2C_RdReg(0x0D);
-    I2C_WrReg(REG_CTRL_REG1, 0x57);// LPEN bit 3
+    /* 2.3.48: derived from LIS3DH_ODR_HZ in SCI.h (was a bare 0x57 = 100Hz).
+       ODR sets the high-pass cutoff and the DURATION tick as well as the sample
+       rate, so it must not be edited here independently of the HARSH_* maths. */
+    I2C_WrReg(REG_CTRL_REG1, LIS3DH_CTRL_REG1);// LPEN bit 3
     I2C_WrReg(REG_CTRL_REG4, 0x08);// HR bit 3
     
     osDelay(200);
@@ -1014,8 +1017,18 @@ void InitAccelerometer_LIS3D(void)
        could reach the comparator as ~0.25g and never cross the 400mg threshold.
        Field-confirmed on 2.3.37 - hcnt stayed 0 across 44 ignition-on pings with
        driving up to 76km/h.
-       11 selects the lowest cutoff (~0.25Hz), which still blocks DC gravity but
-       passes anything shorter than roughly four seconds essentially intact.
+       11 selects the lowest cutoff available for a given ODR.
+
+       2.3.48 - the sentence that used to end this paragraph ("passes anything
+       shorter than roughly four seconds essentially intact") was WRONG, and it
+       is why the filter went unsuspected for four versions. HPCF=11 is ODR/400,
+       so at the old 100Hz ODR the cutoff was 0.25Hz - a 0.64s time constant,
+       the same order as a real brake. Braking is a ramp, not a step: a ~1s ramp
+       to 0.4g arrives at the comparator as roughly 0.15-0.2g. Field-proven on
+       2.3.47 - a measured 0.409g stop left hraw at 0 while a vertical bump
+       (high-frequency, passes intact) triggered fine.
+       The cutoff is not set here; it follows ODR in CTRL_REG1. 25Hz puts it at
+       0.0625Hz (tau 2.5s). See LIS3DH_ODR_HZ in SCI.h.
 
        Bits 7:6 are HPM, the filter mode. 2.3.38 left them at 00 - "normal mode,
        filter reset by reading REFERENCE" - which was the real 2.3.37/2.3.38
@@ -1577,19 +1590,21 @@ static uint32_t ping_poll_count = 0;     // reported as qpoll
    configuration back at ping time (not just after writing it, so an later
    overwrite is still caught) and reports it verbatim.
 
-   Expected if everything assumed is true: 33,57,B7,60,08,0A,2A,19,1E
+   Expected on 2.3.48: 33,37,B7,60,08,0A,2A,0F,02
      WHO_AM_I  0x33 = LIS3DH. Anything else means it is a different chip and
                       every harsh register write has gone somewhere meaningless
                       - the driver also supports MMA8652/8653/8452, where 0x34
                       is not INT2_CFG at all.
-     CTRL_REG1 0x57 = 100Hz ODR, all axes  (sets the DURATION tick to 10ms)
-     CTRL_REG2 0xB7 = HPM=10, lowest cutoff, HP on both generators
+     CTRL_REG1 0x37 = 25Hz ODR, all axes   (2.3.48: was 0x57 = 100Hz. ODR sets
+                      the DURATION tick to 40ms AND the HPF cutoff to ODR/400
+                      = 0.0625Hz - the cutoff is the reason it changed.)
+     CTRL_REG2 0xB7 = HPM=10, lowest cutoff for the ODR, HP on both generators
      CTRL_REG3 0x60 = IA1+IA2 routed to the INT1 pin
      CTRL_REG4 0x08 = +-2g, HR            (sets the THS step to 16mg)
      CTRL_REG5 0x0A = both interrupts latched
      INT2_CFG  0x2A = XHIE|YHIE|ZHIE, OR
-     INT2_THS  0x19 = 25 counts = 400mg
-     INT2_DUR  0x1E = 30 counts = 300ms */
+     INT2_THS  0x0F = 15 counts = 240mg   (2.3.47: was 0x19 = 400mg)
+     INT2_DUR  0x02 = 2 counts  = 80ms    (2.3.48: 100ms is 2.5 ticks at 25Hz) */
 static void HarshRegReadback(char *out, size_t len)
 {
     snprintf(out, len, "&lisreg=%02X,%02X,%02X,%02X,%02X,%02X,%02X,%02X,%02X&i2src=%02X",

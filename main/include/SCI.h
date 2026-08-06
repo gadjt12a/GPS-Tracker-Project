@@ -277,6 +277,10 @@ extern const char *TAG;
    100ms so this remains one variable. */
 #define HARSH_EVENT_G       0.25f   // 2.3.47: was 0.40 (never triggered on real hard braking)
 #define HARSH_EVENT_MS      100     // 2.3.46: was 300 (30 consecutive samples - never met in the field)
+/* NOTE (2.3.48): HARSH_DUR_COUNTS below truncates to 2 at 25Hz, so the real
+   duration gate is 80ms, not 100ms. Unavoidable - DUR ticks are 1/ODR, and
+   100ms is 2.5 ticks. It is the MORE permissive direction, so it cannot mask
+   a positive result: if hraw fires, 80ms vs 100ms did not cause it. */
 #define HARSH_RESET_G       0.25f   // UNUSED - leftover from the pre-2.3.37 software sampler
 #define HARSH_ACCIDENT_G    1.85f   // near-clip spike = accident (stage 2, see below)
 #define HARSH_HOLDOFF_S     15      // min gap between harsh alarms
@@ -287,8 +291,36 @@ extern const char *TAG;
    never drift apart.
      THS  LSB = 16mg   at +-2g full scale (CTRL_REG4 = 0x08)
      DUR  LSB = 1/ODR  = 10ms at 100Hz    (CTRL_REG1 = 0x57)
-   0.25g -> 15 counts, 100ms -> 10 counts. Both well inside the 7-bit fields. */
-#define LIS3DH_ODR_HZ            100
+   0.25g -> 15 counts. Both well inside the 7-bit fields.
+
+   2.3.48: ODR 100Hz -> 25Hz, to move the HIGH-PASS FILTER CUTOFF, not the
+   sample rate. The HPF cutoff scales with ODR (HPCF=11 selects ODR/400), so
+   100Hz put it at 0.25Hz - a 0.64s time constant. That is the same order as a
+   real brake, so the filter cancels the very signal being measured.
+
+   Evidence (2026-08-06 drive, 2.3.47 at 0.25g): a measured 0.409g stop
+   (51.3 -> 22.4 km/h in 2s) and a 0.364g stop both left hraw at 0, with ipoll
+   climbing 8 polls past each event and the interrupt latched - so the sensor
+   genuinely never triggered. A 0.409g brake failing a 0.25g threshold means
+   the threshold was never the blocker. What DID fire, minutes later, had ZH/ZL
+   set (vertical axis) with no deceleration near it - i.e. a bump, which is
+   high-frequency and passes the filter intact.
+
+   Braking is a RAMP, not a step. A step would pass at full amplitude and decay;
+   a ~1s ramp to 0.4g with tau=0.64s reaches the comparator at roughly 0.15-0.2g
+   - under threshold, which is exactly what the field shows. At 25Hz the cutoff
+   drops to 0.0625Hz (tau 2.5s) and that same ramp presents ~0.3g.
+
+   FALSIFIABLE: if the HPF is the cause, hraw fires on braking at the SAME 0.25g
+   threshold. If hraw is still 0, the filter is not the mechanism - stop
+   adjusting it and look elsewhere. Do not also change the threshold. */
+#define LIS3DH_ODR_HZ            25
+/* CTRL_REG1[7:4] ODR selector. MUST agree with LIS3DH_ODR_HZ above - the
+   preprocessor cannot derive one from the other, so they are checked by eye.
+   0001=1Hz 0010=10Hz 0011=25Hz 0100=50Hz 0101=100Hz 0110=200Hz 0111=400Hz.
+   Low nibble 0x7 = LPen off (high-resolution) + Zen|Yen|Xen. */
+#define LIS3DH_ODR_BITS          0x3
+#define LIS3DH_CTRL_REG1   ((unsigned char)((LIS3DH_ODR_BITS << 4) | 0x07))
 #define LIS3DH_THS_MG_PER_LSB    16
 #define HARSH_THS_COUNTS   ((unsigned char)((HARSH_EVENT_G * 1000.0f) / LIS3DH_THS_MG_PER_LSB))
 #define HARSH_DUR_COUNTS   ((unsigned char)((HARSH_EVENT_MS * LIS3DH_ODR_HZ) / 1000))
@@ -304,7 +336,7 @@ extern const char *TAG;
    livelock. See ISSUES.md K1. */
 
 // OTA firmware update
-#define FW_VERSION          "2.3.47"
+#define FW_VERSION          "2.3.48"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096
