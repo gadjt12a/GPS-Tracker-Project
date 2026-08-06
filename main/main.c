@@ -1068,9 +1068,11 @@ void InitAccelerometer_LIS3D(void)
     I2C_RdReg(REG_INT1_SRC); // Clear any latched interrupt so INT1 pin is de-asserted before sleep
 
 #ifdef ENABLE_HARSH_DRIVING
-    /* Generator 2 = harsh driving, entirely in hardware. THS/DURATION are
-       derived from HARSH_EVENT_G / HARSH_EVENT_MS in SCI.h. INT2_CFG 0x2A is
-       XHIE|YHIE|ZHIE with OR combination, so an excursion on any axis fires. */
+    /* Generator 2 = harsh driving, entirely in hardware. THS/DURATION/CFG are
+       all derived from the HARSH_* macros in SCI.h. HARSH_INT2_CFG is 0x0A
+       since 2.3.49 - XHIE|YHIE with OR combination, so a horizontal excursion
+       on either axis fires. ZHIE was dropped because road-surface vertical
+       jolts were swamping the signal; see SCI.h for the evidence. */
     /* THE FIX (2.3.44). This used to end with a blind `I2C_RdReg(REG_INT2_SRC);
        // clear latch` - and that single line is why hraw stayed 0 for six
        versions.
@@ -1099,7 +1101,7 @@ void InitAccelerometer_LIS3D(void)
     }
     I2C_WrReg(REG_INT2_THS, HARSH_THS_COUNTS);
     I2C_WrReg(REG_INT2_DURATION, HARSH_DUR_COUNTS);
-    I2C_WrReg(REG_INT2_CFG, 0x2A);
+    I2C_WrReg(REG_INT2_CFG, HARSH_INT2_CFG);
     harsh_armed = 1;
 #endif
 
@@ -1590,7 +1592,7 @@ static uint32_t ping_poll_count = 0;     // reported as qpoll
    configuration back at ping time (not just after writing it, so an later
    overwrite is still caught) and reports it verbatim.
 
-   Expected on 2.3.48: 33,37,B7,60,08,0A,2A,0F,02
+   Expected on 2.3.49: 33,37,B7,60,08,0A,0A,0F,02
      WHO_AM_I  0x33 = LIS3DH. Anything else means it is a different chip and
                       every harsh register write has gone somewhere meaningless
                       - the driver also supports MMA8652/8653/8452, where 0x34
@@ -1602,7 +1604,8 @@ static uint32_t ping_poll_count = 0;     // reported as qpoll
      CTRL_REG3 0x60 = IA1+IA2 routed to the INT1 pin
      CTRL_REG4 0x08 = +-2g, HR            (sets the THS step to 16mg)
      CTRL_REG5 0x0A = both interrupts latched
-     INT2_CFG  0x2A = XHIE|YHIE|ZHIE, OR
+     INT2_CFG  0x0A = XHIE|YHIE, OR       (2.3.49: was 0x2A, ZHIE dropped -
+                      vertical road jolts were swamping the braking signal)
      INT2_THS  0x0F = 15 counts = 240mg   (2.3.47: was 0x19 = 400mg)
      INT2_DUR  0x02 = 2 counts  = 80ms    (2.3.48: 100ms is 2.5 ticks at 25Hz) */
 static void HarshRegReadback(char *out, size_t len)

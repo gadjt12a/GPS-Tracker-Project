@@ -321,6 +321,31 @@ extern const char *TAG;
    Low nibble 0x7 = LPen off (high-resolution) + Zen|Yen|Xen. */
 #define LIS3DH_ODR_BITS          0x3
 #define LIS3DH_CTRL_REG1   ((unsigned char)((LIS3DH_ODR_BITS << 4) | 0x07))
+
+/* Generator 2 axis enables (INT2_CFG). Bit1 XHIE, bit3 YHIE, bit5 ZHIE, OR
+   combination (AOI=0). The LOW enables (XLIE/YLIE/ZLIE) stay off and must not
+   be turned on: under AOI=0 they mean "fire whenever this axis is BELOW
+   threshold", which is trivially true at rest. 0x3F was tried and gave hraw
+   8 -> 23 on a motionless bench (i2src=0x55). Recorded on diag/harsh-bidir.
+
+   2.3.49: ZHIE dropped, 0x2A -> 0x0A. 2.3.48 fixed the filter and braking
+   started registering (three stops at 0.294/0.252/0.338g each produced an hraw
+   increment at the next poll, on the same 0.25g that had given hraw=0 for a
+   0.409g stop at 100Hz ODR). But the lower cutoff also passes road-surface
+   vertical jolts: hraw ran 3 -> 23 and hcnt 0 -> 12 in eight minutes of
+   ordinary commuting, including two increments during steady 50-58 km/h cruise
+   at +-0.02g longitudinal. Every i2src read with IA actually set involved Z -
+   0x65 (ZH), 0x59 (ZL), 0x56 (ZL) - four for four, matching the bump-triggered
+   alarm on 2.3.47.
+
+   Braking and cornering are horizontal, so Z contributes noise and no signal.
+   ASSUMES Z IS THE VERTICAL AXIS - inferred from bumps firing it, not from a
+   known mounting orientation. If hraw goes back to 0 on braking, that
+   assumption was wrong: revert to 0x2A before changing anything else.
+
+   Accident detection (stage 2, unimplemented) will want vertical sensing back;
+   it should use FIFO capture rather than this generator. */
+#define HARSH_INT2_CFG           0x0A
 #define LIS3DH_THS_MG_PER_LSB    16
 #define HARSH_THS_COUNTS   ((unsigned char)((HARSH_EVENT_G * 1000.0f) / LIS3DH_THS_MG_PER_LSB))
 #define HARSH_DUR_COUNTS   ((unsigned char)((HARSH_EVENT_MS * LIS3DH_ODR_HZ) / 1000))
@@ -336,7 +361,7 @@ extern const char *TAG;
    livelock. See ISSUES.md K1. */
 
 // OTA firmware update
-#define FW_VERSION          "2.3.48"
+#define FW_VERSION          "2.3.49"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096
