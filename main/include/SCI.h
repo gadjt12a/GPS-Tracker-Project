@@ -276,11 +276,40 @@ extern const char *TAG;
    almost exactly Verizon Connect's 0.265g braking figure. Duration stays at
    100ms so this remains one variable. */
 #define HARSH_EVENT_G       0.25f   // 2.3.47: was 0.40 (never triggered on real hard braking)
-#define HARSH_EVENT_MS      100     // 2.3.46: was 300 (30 consecutive samples - never met in the field)
-/* NOTE (2.3.48): HARSH_DUR_COUNTS below truncates to 2 at 25Hz, so the real
-   duration gate is 80ms, not 100ms. Unavoidable - DUR ticks are 1/ODR, and
-   100ms is 2.5 ticks. It is the MORE permissive direction, so it cannot mask
-   a positive result: if hraw fires, 80ms vs 100ms did not cause it. */
+#define HARSH_EVENT_MS      480     // 2.3.50: was 100 (80ms after truncation = no duration gate at all)
+/* 2.3.50 - THE DURATION GATE, not the threshold, is the remaining lever.
+
+   2.3.49 (ZHIE dropped) cut the gated event rate 3x - hcnt/moving-ping fell
+   0.57 -> 0.19 and hraw/moving-ping 1.10 -> 0.26 across ~52h and five drives.
+   But cross-referencing all 18 surviving hcnt events against the GPS speed
+   trace (2026-08-09) showed the residue is still road noise, now arriving
+   through X/Y instead of Z:
+     0 events >= 0.25g, 5 in the 0.15-0.24g band, 11 below 0.15g.
+   Four of the 11 fired at highway speed with no deceleration at all - 0.036g
+   (70.5->65.4 km/h in 4s), 0.040g x2 (71.6->68.8 in 2s), 0.059g (76.6->72.5
+   in 2s). The sensor is not wrong there: those are genuine >0.25g TRANSIENTS
+   (road joints, potholes) that a 2-3s GPS average cannot see.
+
+   Do NOT raise HARSH_EVENT_G to fix this. The five plausible brakes measure
+   0.15-0.24g GPS-averaged, i.e. at or BELOW the current 0.25g threshold, so
+   the two populations overlap in amplitude - raising it removes the real
+   events before the noise. They separate cleanly on DURATION instead:
+   braking is sustained 1-3s, a road jolt is under 100ms.
+
+   The gate was doing nothing. At 25Hz a DUR tick is 40ms, so the old 100ms
+   truncated to 2 ticks = 80ms. 480ms = 12 ticks EXACTLY (no truncation, which
+   is why 480 and not 500). Well inside the HPF tau of 2.5s, so sustained
+   braking still reaches the comparator.
+
+   Threshold and ODR unchanged - one variable. If hraw drops back toward 0 on
+   real braking, the gate is too long: step down 480 -> 320ms (8 ticks) before
+   touching anything else. Expected lisreg: 33,37,B7,60,08,0A,0A,0F,0C
+   (last byte 0C = 12, was 02).
+
+   Two artefacts to ignore when re-running this analysis: the "1.163g" pair on
+   08-07 03:08 is GNSS fix-loss zeroing (82 km/h -> exactly 0.0 in 2s, after a
+   10s sample gap), not braking - the 2.3.33 zero-on-fix-loss path. Separate
+   issue, tracked in ISSUES.md. */
 #define HARSH_RESET_G       0.25f   // UNUSED - leftover from the pre-2.3.37 software sampler
 #define HARSH_ACCIDENT_G    1.85f   // near-clip spike = accident (stage 2, see below)
 #define HARSH_HOLDOFF_S     15      // min gap between harsh alarms
@@ -361,7 +390,7 @@ extern const char *TAG;
    livelock. See ISSUES.md K1. */
 
 // OTA firmware update
-#define FW_VERSION          "2.3.49"
+#define FW_VERSION          "2.3.50"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 #define OTA_CHUNK_SIZE      4096
