@@ -328,7 +328,8 @@ samples on the actual vehicle.
 **P2 · FIXED 2026-07-28**
 
 `git init` at the project root. Tracks `CLAUDE.md`, `ota-server/publish.ps1`,
-`docker-compose.yml`, `nginx.conf`, `zimaboard-setup.sh` and the sync-docs skill. Excludes
+`docker-compose.yml`, `nginx.conf`, `zimaboard-setup.sh` and the update-docs skill (renamed
+from sync-docs 2026-08-09). Excludes
 the firmware repo (own remote), built `.bin` files and machine-local Claude permissions.
 `.gitattributes` pins LF on files that execute on the Zimaboard, since a CRLF
 `zimaboard-setup.sh` would fail with "bad interpreter". No remote configured yet - local
