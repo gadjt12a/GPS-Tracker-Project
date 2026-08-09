@@ -524,6 +524,7 @@ unsigned short SystemTimer;
 unsigned short InactivityTimer;
 unsigned long  IntervalTimer;
 volatile int   force_ping_now = 0; // set by PING_NOW remote command; cleared after next ping
+uint8_t ota_channel = OTA_CHANNEL_PRODUCTION; // OTA source; loaded from NVS at boot (2.3.51)
 unsigned short MotionTimer=0;
 uint32_t ParkLongTimer = 0;      // seconds since last motion; 48hr threshold → deep sleep
 static int heartbeat_wake = 0;   // 1 when woken by 8hr timer; cleared after first ping
@@ -1315,6 +1316,8 @@ void WakeUp(void);
 void CheckAndApplyOTA(void);
 void nvs_save_position(void);
 void nvs_load_position(void);
+void ota_channel_load(void);
+void ota_channel_save(uint8_t ch);
 
 
 
@@ -4902,8 +4905,17 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
                  (unsigned)((track_tail - track_head + TRACK_BUF_SIZE) % TRACK_BUF_SIZE),
                  (unsigned long)track_drop_count);
 
+        /* Emitted ONLY on the staging channel (2.3.51), so production pings are
+           byte-identical to before and nothing has to be un-learned. Its
+           presence is the whole signal: a unit showing otach=1 is on a test
+           build and must be brought home with `Moved V_OTA` before it is
+           forgotten about. Absence means production. */
+        char och_part[16] = "";
+        if (ota_channel == OTA_CHANNEL_STAGING)
+            snprintf(och_part, sizeof(och_part), "&otach=1");
+
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s%s%s&fwver=" FW_VERSION,
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s%s%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed / 1.852f, // OsmAnd speed param is knots
         ts_part,
@@ -4918,6 +4930,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         lis_part,
         trk_part,
         ota_part,
+        och_part,
         _alarm);
     }
     Print("AT+HTTPPARA=\"URL\",\"");
@@ -5020,10 +5033,31 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
                 osDelay(500);
                 esp_restart();
             }
-            if(MapForward(Buff2,BUFF2_SIZE,(char*)"V_OTA",5) != NULL)
+            /* ORDER MATTERS: "V_OTA" is a prefix of "V_OTA_TEST", and MapForward
+               is a substring search, so a bare V_OTA test would also fire on
+               V_OTA_TEST. Match the longer command first and make the V_OTA
+               branch conditional on it having missed. */
+            if(MapForward(Buff2,BUFF2_SIZE,(char*)"V_OTA_TEST",10) != NULL)
+            {
+                /* "Moved V_OTA_TEST" - move THIS device to the staging channel
+                   and update from it. Per-device by construction: Traccar sends
+                   the command to one device. Channel is written to NVS first so
+                   it survives the reboot the update causes; otherwise the next
+                   boot check would read production and pull straight back. */
+                ota_channel_save(OTA_CHANNEL_STAGING);
+                Print("AT+HTTPTERM\r\n");
+                osDelay(500);
+                ota_check_timer = 86400UL; // trigger periodic OTA path on next loop
+            }
+            else if(MapForward(Buff2,BUFF2_SIZE,(char*)"V_OTA",5) != NULL)
             {
                 /* Remote OTA check via Traccar custom command "Moved V_OTA".
-                   Runs CheckAndApplyOTA immediately; reboots if update found. */
+                   Runs CheckAndApplyOTA immediately; reboots if update found.
+                   Also the way home from staging: it resets the channel to
+                   production, so a staged unit comes back on the next check.
+                   The version comparison is strcmp-inequality, so returning to
+                   an older production build works as a downgrade. */
+                ota_channel_save(OTA_CHANNEL_PRODUCTION);
                 Print("AT+HTTPTERM\r\n");
                 osDelay(500);
                 ota_check_timer = 86400UL; // trigger periodic OTA path on next loop
@@ -7360,6 +7394,9 @@ ESP_LOGI(TAG,"Entered main task");
     //
     SyncRTC();
     osDelay(10000); // Let LTE data routing stabilize before attempting OTA HTTP
+    /* Must precede CheckAndApplyOTA - it decides which server that reads.
+       A staged unit that loaded production here would revert on every boot. */
+    ota_channel_load();
     CheckAndApplyOTA();
     /* Restore last known position from NVS so we can ping Traccar immediately
        after reboot without waiting for a GPS fix. */
@@ -8549,6 +8586,47 @@ void nvs_load_position(void)
     }
 }
 
+/* ---- OTA channel (2.3.51) --------------------------------------------
+   Which OTA server this device reads. Persisted in NVS because the channel
+   has to survive the reboot that the update itself causes - see SCI.h.
+   Defaults to production, so a unit that has never been staged, or whose NVS
+   was wiped, behaves exactly as before. */
+void ota_channel_save(uint8_t ch)
+{
+    ota_channel = ch;
+    nvs_handle_t h;
+    if (nvs_open("valtrack", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "ota_ch", ch);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+void ota_channel_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("valtrack", NVS_READONLY, &h) == ESP_OK) {
+        uint8_t ch = OTA_CHANNEL_PRODUCTION;
+        /* Absent key leaves ch untouched, i.e. production. */
+        nvs_get_u8(h, "ota_ch", &ch);
+        nvs_close(h);
+        ota_channel = (ch == OTA_CHANNEL_STAGING) ? OTA_CHANNEL_STAGING
+                                                  : OTA_CHANNEL_PRODUCTION;
+    }
+}
+
+static const char *ota_version_url(void)
+{
+    return (ota_channel == OTA_CHANNEL_STAGING) ? OTA_STAGING_VERSION_URL
+                                                : OTA_VERSION_URL;
+}
+
+static const char *ota_firmware_url(void)
+{
+    return (ota_channel == OTA_CHANNEL_STAGING) ? OTA_STAGING_FIRMWARE_URL
+                                                : OTA_FIRMWARE_URL;
+}
+
 static bool ota_network_up(void)
 {
     sprintf(str, "AT+CGDCONT=1,\"IP\",\"%s\"\r\n", Params.Fields.APNName);
@@ -8646,7 +8724,9 @@ void CheckAndApplyOTA(void)
     uint8_t         *chunk_buf = NULL;
     bool             ota_begun = false;
 
-    ESP_LOGI(TAG, "OTA: check %s (running %s)", OTA_VERSION_URL, FW_VERSION);
+    ESP_LOGI(TAG, "OTA: check %s (running %s, channel %s)", ota_version_url(),
+             FW_VERSION,
+             ota_channel == OTA_CHANNEL_STAGING ? "STAGING" : "production");
 
     // ---- Step 1: fetch version.json (retry once if first attempt fails) ----
     bool version_ok = false;
@@ -8659,7 +8739,7 @@ void CheckAndApplyOTA(void)
             ESP_LOGW(TAG, "OTA: PDP context failed (attempt %d)", otry + 1);
             continue;
         }
-        ota_http_open(OTA_VERSION_URL);
+        ota_http_open(ota_version_url());
         if (ota_http_action_size() < 0) { ota_http_close(); continue; }
         osDelay(500);
         ResetBuffer();
@@ -8687,7 +8767,7 @@ void CheckAndApplyOTA(void)
     // ---- Step 2: determine firmware size ----
     // AT+HTTPACTION=0 downloads the full binary into the modem's HTTP buffer.
     // Keep the session open — Step 4 reads directly from this buffer.
-    ota_http_open(OTA_FIRMWARE_URL);
+    ota_http_open(ota_firmware_url());
     int firmware_size = ota_http_action_size();
 
     if (firmware_size <= 0 || firmware_size > (int)OTA_MAX_FIRMWARE) {

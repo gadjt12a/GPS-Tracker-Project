@@ -390,9 +390,35 @@ extern const char *TAG;
    livelock. See ISSUES.md K1. */
 
 // OTA firmware update
-#define FW_VERSION          "2.3.50"
+#define FW_VERSION          "2.3.51"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
+
+/* 2.3.51 - STAGING OTA CHANNEL.
+   Lets one device be moved to a test build without touching the fleet.
+   `Moved V_OTA_TEST` switches this device to the staging channel and updates;
+   `Moved V_OTA` switches it back to production and updates (a downgrade is
+   fine - the version comparison is strcmp-inequality, not ordering).
+
+   Traccar commands are addressed to a single device, so this gives the
+   per-device targeting that `version.json` alone cannot: production
+   version.json is global, but which URL a device reads is now per-device.
+
+   THE CHANNEL MUST PERSIST IN NVS. Without that, the staging build reboots,
+   `CheckAndApplyOTA()` runs at boot against the production URL, sees a
+   different version and immediately pulls the device back - an OTA ping-pong
+   that burns cellular data on every cycle. Stored as `ota_ch` in the existing
+   "valtrack" namespace.
+
+   If the staging server is unreachable the device STAYS on the staging
+   channel and simply skips the update. Auto-reverting would reintroduce the
+   ping-pong. Recovery is `Moved V_OTA` (back to production) or `V_RESET`,
+   neither of which depends on the staging host being up. */
+#define OTA_STAGING_VERSION_URL   "http://ota.pawson.co.nz/staging/version.json"
+#define OTA_STAGING_FIRMWARE_URL  "http://ota.pawson.co.nz/staging/firmware.bin"
+
+#define OTA_CHANNEL_PRODUCTION    0
+#define OTA_CHANNEL_STAGING       1
 #define OTA_CHUNK_SIZE      4096
 #define OTA_MAX_FIRMWARE    0xEE000  // must fit in one OTA partition
 
