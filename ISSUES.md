@@ -258,11 +258,18 @@ changed only `INT2_CFG` (generator **2**), which should not affect motion wake a
 the HPF-cutoff theory is unproven and the honest reading is that the rate is not constant.
 **Do not assume 2.3.48 caused this** - the gate is fragile either way.
 
-**Second, unverified gate:** `DeepSleep()` also requires
-`Params.Fields.WorkingMode[0] == 'T' || 'H'` (`main.c:6921`). The bench units' `WorkingMode`
-has not been checked. If it is neither, deep sleep never runs regardless of the timer and
-everything above is moot. **Check this first - it is one BLE config read and it could make
-the rest of this issue irrelevant.**
+**Second gate CHECKED AND CLEARED 2026-08-09 - it is not the blocker.** `DeepSleep()` also
+requires `Params.Fields.WorkingMode[0] == 'T' || 'H'` (`main.c:6955`). The default is
+`"HTTP"` (`main.c:736`), i.e. `'H'`, which passes.
+
+Confirmed behaviourally rather than by reading the stored config, which is stronger: the
+mode dispatch at `main.c:8227-8295` routes `'T'` to TCP, `'U'` to UDP and `else` to HTTP,
+and the units' pings arrive as OsmAnd HTTP GETs through `XHTTP_Request` - the `'H'` branch.
+`qpoll=0` on every unit corroborates it, since that counter lives in `XUDP_Request` and
+would be moving if the mode were `'U'`.
+
+The device is provably in the branch whose gate passes, so **the `ParkLongTimer` reset above
+is the sole cause.** No BLE read needed, and the fix directions below stand unchanged.
 
 **Fix direction (needs a decision, not just a patch):** one interrupt should not discard 48 h
 of accumulated stillness. Options, cheapest first:
