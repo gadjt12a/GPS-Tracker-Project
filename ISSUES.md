@@ -215,38 +215,68 @@ lacks `-mtune=esp-base`. Fix documented in CLAUDE.md.
 
 ## D. Power management
 
-### D1 — Deep sleep did not engage after 52.5 h uptime (UNCONFIRMED - may be correct behaviour)
-**P2 · OPEN · observed 2026-08-09 · needs a controlled test before any code change**
+### D1 — Deep sleep can never engage: any single motion interrupt resets the 48 h counter
+**P2 · CONFIRMED 2026-08-09 on two undisturbed bench units · mechanism located in code**
 
-Van uptime rose monotonically to **188,932 s (52.5 h)** across 2026-08-06 to 08-09 with no
-reboot and no deep-sleep cycle, despite `PARK_LONG_SECONDS` being 172,800 s (48 h).
+**The 48 h deep-sleep gate is effectively unreachable in any environment with occasional
+vibration.** This is a design fragility, not a tuning problem.
 
-**This is probably not a bug.** Deep sleep gates on `ParkLongTimer`, which counts seconds
-since *last motion*, not uptime - and the van was driven on 08-07 and 08-08. Five drives in
-that window means the 48 h stationary condition plausibly never held. Uptime is simply the
-wrong variable to judge it by, and no attribute currently reports `ParkLongTimer`.
+`main.c:3287-3291`, on every pass where the INT1 pin reads asserted:
 
-**Why it is worth checking anyway:** 2.3.48 lowered the LIS3DH high-pass cutoff from 0.25 Hz
-to 0.0625 Hz (ODR 100 Hz -> 25 Hz). That filter also feeds **generator 1, the 64 mg motion
-wake**, so the change makes motion wake marginally more sensitive to slow movement. If it
-now trips on thermal creep, wind rock or a passing truck, `ParkLongTimer` would be reset
-continuously and deep sleep could **never** engage - silently, on a vehicle parked for
-weeks, which is exactly the scenario the feature exists for. That risk was flagged when
-2.3.48 shipped and has not been tested since.
+```c
+if(INT1 == 0)
+{
+    MotionTimer=0;
+    ParkLongTimer = 0;      // <-- 48 h counter reset to zero by ONE interrupt
+```
 
-**Confirm by (cheapest first):**
-1. Leave a **bench** unit genuinely undisturbed and watch whether the parked 5-minute cadence
-   settles and holds. Motion wake firing on nothing shows up as `ipoll` climbing on a
-   stationary unit - on 2.3.49 a stationary van gave `ipoll=0` over 15 minutes, which is the
-   healthy signature.
-2. If cadence looks right, this is a non-issue - close it.
-3. Only if it looks wrong: add a `plt` (ParkLongTimer) attribute so the gate is observable
-   instead of inferred. There is currently **no way to distinguish "not yet 48 h stationary"
-   from "timer keeps resetting"** from server data alone, which is the real gap here.
+`ParkLongTimer` increments once per second (`main.c:3313`) and `DeepSleep()` requires
+`ParkLongTimer >= PARK_LONG_SECONDS` (`main.c:6923`). So deep sleep needs **48 consecutive
+hours with not one INT1 assertion**. A single 64 mg blip anywhere in that window restarts
+the count from zero.
 
-**Do not raise the motion-wake threshold speculatively.** Motion wake is what ends deep
-sleep; desensitising it to fix a suspected sleep problem risks a vehicle that sleeps through
-being driven away. Measure first.
+**Field measurement (2.3.49, units 2 and 3, sitting on a bench PSU in a garage, undisturbed
+by the owner for the whole window):**
+
+| Unit | Boot duration | uptime reached | `ipoll` | implied resets |
+|---|---|---|---|---|
+| -5783 | 55.0 h wall | 198,167 s (55.0 h) | 0 -> **47** | ~0.85 / h |
+| -5742 | 55.0 h wall | 198,109 s (55.0 h) | 0 -> **19** | ~0.35 / h |
+
+`ipoll` counts executions of that same `if(INT1 == 0)` block, so it *is* the reset count.
+Neither unit deep-slept, and at those rates neither ever could: the longest possible gap
+between resets is far under 48 h. `hraw=0` on both, so every one of those assertions came
+from generator 1 (motion wake), not the harsh generator.
+
+**These are almost certainly genuine environmental vibration** - a garage has doors, vehicles
+and footfall, and 64 mg is sensitive. That is the point: the feature is specified for a
+vehicle parked for days, which is exactly where stray vibration is guaranteed.
+
+**Not yet attributed to 2.3.48.** Suggestive but not conclusive: 2.3.48 ran 13.3 h with
+`ipoll=0` on both units, where the 2.3.49 rates predict ~11 and ~4.6. Against that, 2.3.49
+changed only `INT2_CFG` (generator **2**), which should not affect motion wake at all. So
+the HPF-cutoff theory is unproven and the honest reading is that the rate is not constant.
+**Do not assume 2.3.48 caused this** - the gate is fragile either way.
+
+**Second, unverified gate:** `DeepSleep()` also requires
+`Params.Fields.WorkingMode[0] == 'T' || 'H'` (`main.c:6921`). The bench units' `WorkingMode`
+has not been checked. If it is neither, deep sleep never runs regardless of the timer and
+everything above is moot. **Check this first - it is one BLE config read and it could make
+the rest of this issue irrelevant.**
+
+**Fix direction (needs a decision, not just a patch):** one interrupt should not discard 48 h
+of accumulated stillness. Options, cheapest first:
+1. **Debounce the reset** - require N assertions within a window, or a sustained
+   `MotionTimer` run, before zeroing `ParkLongTimer`. Isolated blips then decay instead of
+   resetting.
+2. **Decay instead of reset** - subtract a penalty rather than zeroing, so real driving still
+   clears it quickly but a door slam costs minutes.
+3. Raise the generator-1 threshold above 64 mg. **Least preferred** - motion wake is what
+   *ends* deep sleep, and desensitising it risks a unit that sleeps through being driven away.
+
+**Instrument first regardless:** add a `plt` (ParkLongTimer) attribute. Right now
+"not yet 48 h stationary" and "timer keeps resetting" are indistinguishable from server data,
+which is why this sat as a suspicion for so long.
 
 ---
 
