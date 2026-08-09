@@ -390,7 +390,7 @@ extern const char *TAG;
    livelock. See ISSUES.md K1. */
 
 // OTA firmware update
-#define FW_VERSION          "2.3.51"
+#define FW_VERSION          "2.3.52"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 
@@ -419,6 +419,32 @@ extern const char *TAG;
 
 #define OTA_CHANNEL_PRODUCTION    0
 #define OTA_CHANNEL_STAGING       1
+
+/* 2.3.52 - MOTION CONFIRMATION FOR DEEP SLEEP (ISSUES.md D1).
+   ParkLongTimer was zeroed by ANY single INT1 assertion, so deep sleep needed
+   48 CONSECUTIVE hours with not one interrupt. Measured on two undisturbed
+   bench units: 55h uptime, no sleep, ipoll 47 and 19 - i.e. one stray
+   assertion every ~70 and ~170 minutes from ordinary garage vibration. The
+   gate was unreachable anywhere a vehicle actually parks.
+
+   Now ParkLongTimer only resets on CONFIRMED motion: MOTION_CONFIRM_COUNT
+   distinct assertions inside a MOTION_CONFIRM_WINDOW_S window.
+
+   The numbers come from the measured separation between the two populations,
+   which is about two orders of magnitude:
+     - bench noise     ~0.35-0.85 assertions/hour, isolated and uncorrelated
+     - active driving  ~10 assertions/MINUTE (ipoll 92 -> 132 in four minutes)
+   3-in-120s is trivially satisfied seconds into any real drive, and needs
+   three independent knocks inside two minutes to be met by noise - which at
+   the measured bench rate is vanishingly unlikely.
+
+   Raising the 64mg generator-1 threshold was rejected as the fix: motion wake
+   is what ENDS deep sleep, so desensitising it risks a unit sleeping through
+   being driven away. Debouncing the consumer is safe; blunting the sensor is
+   not. MotionTimer is deliberately left undebounced - it drives the 30s/5min
+   adaptive cadence, where reacting to the first movement is correct. */
+#define MOTION_CONFIRM_COUNT      3     // distinct INT1 assertions...
+#define MOTION_CONFIRM_WINDOW_S   120   // ...required within this many seconds
 #define OTA_CHUNK_SIZE      4096
 #define OTA_MAX_FIRMWARE    0xEE000  // must fit in one OTA partition
 

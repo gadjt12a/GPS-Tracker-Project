@@ -527,6 +527,22 @@ volatile int   force_ping_now = 0; // set by PING_NOW remote command; cleared af
 uint8_t ota_channel = OTA_CHANNEL_PRODUCTION; // OTA source; loaded from NVS at boot (2.3.51)
 unsigned short MotionTimer=0;
 uint32_t ParkLongTimer = 0;      // seconds since last motion; 48hr threshold → deep sleep
+/* Motion confirmation for ParkLongTimer (2.3.52, ISSUES.md D1).
+   ParkLongTimer used to be zeroed by ANY single INT1 assertion, so deep sleep
+   needed 48 CONSECUTIVE hours with not one interrupt - unreachable anywhere
+   with occasional vibration. Two undisturbed bench units ran 55h without
+   sleeping (ipoll 47 and 19). These track distinct assertions inside a rolling
+   window so an isolated knock decays instead of discarding 48h of stillness.
+   MotionTimer is deliberately NOT debounced - it drives the 30s/5min adaptive
+   cadence, where reacting to the first movement is correct. */
+static uint32_t motion_events      = 0;  // distinct assertions in the current window
+static uint32_t motion_window_left = 0;  // seconds remaining in that window
+/* Matches SystemTimer's type (unsigned short). It wraps every ~18.2h and is
+   zeroed at main.c:8386; both are harmless here, since a false "same second"
+   only skips one count toward a confirmation that real motion re-earns within
+   seconds. */
+static unsigned short motion_last_second = 0; // de-dupes passes of one latched event
+static uint32_t park_reset_count   = 0;  // times motion was CONFIRMED (reported as pltr)
 static int heartbeat_wake = 0;   // 1 when woken by 8hr timer; cleared after first ping
 uint32_t ota_check_timer = 0;   // seconds since last OTA check; 24hr periodic check
 float last_good_lat = 0.0f; // last GPS fix — persisted to NVS, survives reboots
@@ -3290,8 +3306,28 @@ void StartTimerTask(void *argument)
     if(INT1 == 0)
     {
         #ifndef TIMER_ONLY_WAKEUP
-            MotionTimer=0;
-            ParkLongTimer = 0;
+            MotionTimer=0;   // NOT debounced - adaptive cadence must react at once
+
+            /* 2.3.52 (D1): ParkLongTimer only surrenders to CONFIRMED motion.
+               The de-dupe on SystemTimer matters because this block runs on
+               every main-loop pass while the latched pin is still low, so one
+               physical event can otherwise be counted many times and defeat
+               the confirmation entirely. */
+            if (SystemTimer != motion_last_second)
+            {
+                motion_last_second = SystemTimer;
+                if (motion_window_left == 0) {
+                    motion_window_left = MOTION_CONFIRM_WINDOW_S;
+                    motion_events      = 1;
+                } else {
+                    motion_events++;
+                }
+                if (motion_events >= MOTION_CONFIRM_COUNT) {
+                    ParkLongTimer = 0;
+                    park_reset_count++;
+                    motion_window_left = MOTION_CONFIRM_WINDOW_S; // stay armed while moving
+                }
+            }
 
             #ifdef VALTRACK_V4_VTS
                 if(FrontPanelTimer > 120)
@@ -3315,6 +3351,14 @@ void StartTimerTask(void *argument)
         MotionTimer++;
         if (ParkLongTimer <= PARK_LONG_SECONDS)
             ParkLongTimer++;
+        /* 2.3.52 (D1): expire the confirmation window. When it lapses the
+           partial count is discarded, so isolated knocks never accumulate
+           across hours into a false confirmation. */
+        if (motion_window_left > 0) {
+            motion_window_left--;
+            if (motion_window_left == 0)
+                motion_events = 0;
+        }
         #endif
         ota_check_timer++;
         if (SystemTimer % TRACK_SAMPLE_SECONDS == 0)
@@ -4914,8 +4958,23 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         if (ota_channel == OTA_CHANNEL_STAGING)
             snprintf(och_part, sizeof(och_part), "&otach=1");
 
+        /* Deep-sleep observability (2.3.52, D1). Until now "not yet 48h
+           stationary" and "the timer keeps resetting" were indistinguishable
+           from server data, which is why D1 sat as a suspicion for weeks.
+             plt  - ParkLongTimer, seconds of confirmed stillness. Deep sleep
+                    fires at PARK_LONG_SECONDS (172800). Should climb 1:1 with
+                    uptime on an undisturbed unit.
+             pltr - times motion was CONFIRMED and plt was zeroed.
+           Read pltr AGAINST ipoll: ipoll counts every assertion, pltr counts
+           only those that survived confirmation. On the bench ipoll should
+           climb while pltr stays 0 - that gap IS the fix working. If pltr
+           tracks ipoll, the window is too permissive. */
+        char plt_part[40] = "";
+        snprintf(plt_part, sizeof(plt_part), "&plt=%lu&pltr=%lu",
+                 (unsigned long)ParkLongTimer, (unsigned long)park_reset_count);
+
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s%s%s%s&fwver=" FW_VERSION,
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s%s%s%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed / 1.852f, // OsmAnd speed param is knots
         ts_part,
@@ -4931,6 +4990,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         trk_part,
         ota_part,
         och_part,
+        plt_part,
         _alarm);
     }
     Print("AT+HTTPPARA=\"URL\",\"");
