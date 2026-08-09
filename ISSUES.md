@@ -64,6 +64,45 @@ G1 (stop escalating when parked). If it does, there is a real hardware or modem 
 
 ---
 
+### G4 — Fix loss mid-drive publishes speed 0.0 as a real sample, faking a 1.16g stop
+**P2 · OPEN · found 2026-08-09 in 2.3.49 field data**
+
+The 2.3.33 fix zeroes `fLat`/`fLong`/`fSpeed` when a fix is lost, which correctly stopped
+stale fixes being replayed as live. But a **track sample** recorded during that window is
+still delivered to Traccar carrying `speed=0.0`, indistinguishable from a genuine stop.
+
+Van, 2026-08-07 03:08 UTC, at open-road speed:
+
+| GPS time (UTC) | speed | note |
+|---|---|---|
+| 03:07:56 | 82.8 km/h | last sample before a **10 s gap** (norm is 2-3 s on 2.3.47+) |
+| 03:08:06 | 82.8 km/h | |
+| 03:08:09 | 82.1 km/h | |
+| 03:08:11 | **0.0 km/h** | fix lost - zeroed, not decelerated |
+
+A vehicle does not go 82 km/h to *exactly* 0.0 in 2 s. Computing deceleration across that
+pair yields **1.163 g**, which is above `HARSH_ACCIDENT_G` (1.85 g is the accident gate, so
+this particular value does not trip it - but the margin is uncomfortable and a shorter gap
+would produce a larger figure).
+
+**Two distinct harms:**
+1. **Corrupts any GPS-derived analysis.** This artefact appeared twice in the 2.3.50 harsh
+   cross-reference and initially read as two genuine hard brakes. Anyone repeating that
+   analysis will hit it again.
+2. **Pollutes Traccar.** A phantom stop-from-speed inside a trip affects trip segmentation
+   and any server-side harsh/accident detection keyed on speed deltas.
+
+**Fix:** do not emit a track sample when the fix is not live. The zeroing is correct as a
+*safety* measure (better than replaying a stale position) but zero is being published as
+data. Either drop the sample, or omit `speed=` so Traccar does not infer a deceleration.
+Note `LoadGPSTimeStamp` (C4) is unguarded on the same globals - likely the same root path.
+
+**Secondary question worth answering at the same time:** why a ~10 s GPS gap at 82 km/h on
+2.3.49 at all, when the measured norm is 2-3 s. Could be an ordinary fix dropout, or the
+sampling stall that G2 is about. Do not assume; check `gpsnr`/`gpsage` around the event.
+
+---
+
 ### G3 — GNSS config not re-applied after a power-cycle
 **P3 · OPEN**
 
@@ -171,6 +210,43 @@ attributes. One change at a time.
 ### K4 — cmake cache picks up the wrong GCC
 **P2 · OPEN (worked around)** — manual cmake runs grab local Espressif GCC 14.2.0, which
 lacks `-mtune=esp-base`. Fix documented in CLAUDE.md.
+
+---
+
+## D. Power management
+
+### D1 — Deep sleep did not engage after 52.5 h uptime (UNCONFIRMED - may be correct behaviour)
+**P2 · OPEN · observed 2026-08-09 · needs a controlled test before any code change**
+
+Van uptime rose monotonically to **188,932 s (52.5 h)** across 2026-08-06 to 08-09 with no
+reboot and no deep-sleep cycle, despite `PARK_LONG_SECONDS` being 172,800 s (48 h).
+
+**This is probably not a bug.** Deep sleep gates on `ParkLongTimer`, which counts seconds
+since *last motion*, not uptime - and the van was driven on 08-07 and 08-08. Five drives in
+that window means the 48 h stationary condition plausibly never held. Uptime is simply the
+wrong variable to judge it by, and no attribute currently reports `ParkLongTimer`.
+
+**Why it is worth checking anyway:** 2.3.48 lowered the LIS3DH high-pass cutoff from 0.25 Hz
+to 0.0625 Hz (ODR 100 Hz -> 25 Hz). That filter also feeds **generator 1, the 64 mg motion
+wake**, so the change makes motion wake marginally more sensitive to slow movement. If it
+now trips on thermal creep, wind rock or a passing truck, `ParkLongTimer` would be reset
+continuously and deep sleep could **never** engage - silently, on a vehicle parked for
+weeks, which is exactly the scenario the feature exists for. That risk was flagged when
+2.3.48 shipped and has not been tested since.
+
+**Confirm by (cheapest first):**
+1. Leave a **bench** unit genuinely undisturbed and watch whether the parked 5-minute cadence
+   settles and holds. Motion wake firing on nothing shows up as `ipoll` climbing on a
+   stationary unit - on 2.3.49 a stationary van gave `ipoll=0` over 15 minutes, which is the
+   healthy signature.
+2. If cadence looks right, this is a non-issue - close it.
+3. Only if it looks wrong: add a `plt` (ParkLongTimer) attribute so the gate is observable
+   instead of inferred. There is currently **no way to distinguish "not yet 48 h stationary"
+   from "timer keeps resetting"** from server data alone, which is the real gap here.
+
+**Do not raise the motion-wake threshold speculatively.** Motion wake is what ends deep
+sleep; desensitising it to fix a suspected sleep problem risks a vehicle that sleeps through
+being driven away. Measure first.
 
 ---
 
@@ -369,3 +445,12 @@ form.
 4. **K1 / 2.3.34** — harsh driving hardening. The actual project goal.
 5. **C2, C3** — small correctness fixes, bundle into 2.3.34.
 6. **C4-C8** — cleanup, low priority.
+
+**Updated 2026-08-09:**
+
+1. **D1** — costs nothing but an undisturbed bench unit, and the failure mode (a vehicle
+   that never sleeps) is invisible until a battery is flat. Do this while 2.3.50 is being
+   road-tested; the two do not conflict.
+2. **G4** — fix before the next GPS-derived analysis, not after. It has already produced two
+   false "hard brake" readings and it will do so again. Bundle with **C4**, which is the same
+   unguarded-globals path.
