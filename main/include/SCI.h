@@ -276,7 +276,7 @@ extern const char *TAG;
    almost exactly Verizon Connect's 0.265g braking figure. Duration stays at
    100ms so this remains one variable. */
 #define HARSH_EVENT_G       0.25f   // 2.3.47: was 0.40 (never triggered on real hard braking)
-#define HARSH_EVENT_MS      480     // 2.3.50: was 100 (80ms after truncation = no duration gate at all)
+#define HARSH_EVENT_MS      320     // 2.3.53: was 480 (too long - suppressed a 0.518g brake)
 /* 2.3.50 - THE DURATION GATE, not the threshold, is the remaining lever.
 
    2.3.49 (ZHIE dropped) cut the gated event rate 3x - hcnt/moving-ping fell
@@ -305,6 +305,35 @@ extern const char *TAG;
    real braking, the gate is too long: step down 480 -> 320ms (8 ticks) before
    touching anything else. Expected lisreg: 33,37,B7,60,08,0A,0A,0F,0C
    (last byte 0C = 12, was 02).
+
+   2.3.53 - THAT PREDICTION FIRED. 480ms suppressed everything, including real
+   braking. Van drive 2026-08-09/10 on 2.3.50: hraw=0 and hcnt=0 across 29
+   moving pings, with i2src never showing IA set at all (0x25/0x26 only). The
+   drive contained a **0.518g** stop - 71.8 -> 35.2 km/h in 2s - plus 0.243g
+   and 0.221g. A 0.518g deceleration sustained for 2s is more than double the
+   0.24g threshold and four times the 480ms requirement, and it produced
+   nothing.
+
+   MECHANISM, and the thing that was underweighted when 480ms was chosen:
+   INT2_DURATION counts CONSECUTIVE samples above threshold. One sample dipping
+   below resets the counter. At 25Hz, 480ms is 12 unbroken samples - and real
+   braking ramps while road vibration dithers the signal through the high-pass
+   filter, so a 12-sample unbroken run may essentially never occur. This is the
+   SAME failure that killed 2.3.46's 300ms gate at 100Hz (30 consecutive
+   samples); the note about it is a few lines above, and it should have carried
+   more weight here. The duration lever is real - noise suppression worked,
+   expected ~7.5 events at the 2.3.49 rate and got 0 - but it is far more
+   fragile than "braking is 1-3s, jolts are <100ms" suggests.
+
+   320ms = 8 ticks exactly at 25Hz. Threshold and ODR still untouched.
+   Expected lisreg: 33,37,B7,60,08,0A,0A,0F,08 (last byte 08 = 8).
+
+   IF 320ms ALSO GIVES hraw=0 ON REAL BRAKING, STOP TUNING THIS REGISTER.
+   Noise fires at 80ms and real braking dies by 320ms would mean the two
+   populations do not separate on consecutive-sample duration at all, and the
+   answer moves to firmware-side gating - e.g. requiring N hraw events inside a
+   window, where a dip between them is survivable - or to FIFO capture. Do not
+   keep bisecting a lever that has been shown not to work.
 
    Two artefacts to ignore when re-running this analysis: the "1.163g" pair on
    08-07 03:08 is GNSS fix-loss zeroing (82 km/h -> exactly 0.0 in 2s, after a
@@ -390,7 +419,7 @@ extern const char *TAG;
    livelock. See ISSUES.md K1. */
 
 // OTA firmware update
-#define FW_VERSION          "2.3.52"
+#define FW_VERSION          "2.3.53"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 
