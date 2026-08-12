@@ -276,7 +276,7 @@ extern const char *TAG;
    almost exactly Verizon Connect's 0.265g braking figure. Duration stays at
    100ms so this remains one variable. */
 #define HARSH_EVENT_G       0.25f   // 2.3.47: was 0.40 (never triggered on real hard braking)
-#define HARSH_EVENT_MS      320     // 2.3.53: was 480 (too long - suppressed a 0.518g brake)
+#define HARSH_EVENT_MS      80      // 2.3.54: back to 2 ticks - the only value proven to detect braking
 /* 2.3.50 - THE DURATION GATE, not the threshold, is the remaining lever.
 
    2.3.49 (ZHIE dropped) cut the gated event rate 3x - hcnt/moving-ping fell
@@ -328,7 +328,21 @@ extern const char *TAG;
    320ms = 8 ticks exactly at 25Hz. Threshold and ODR still untouched.
    Expected lisreg: 33,37,B7,60,08,0A,0A,0F,08 (last byte 08 = 8).
 
-   IF 320ms ALSO GIVES hraw=0 ON REAL BRAKING, STOP TUNING THIS REGISTER.
+   2.3.54 - IT DID, AND THE REGISTER IS NOW SETTLED AT 80ms. Van drive
+   2026-08-12 on 2.3.53-rc1 (320ms): hraw=0 and hcnt=0 with ipoll=454 over 382
+   moving samples, and the drive contained a **0.391g** stop (68.9 -> 27.5 km/h
+   in 3s) plus 0.289g. Three durations measured on real drives:
+     2 ticks  (80ms)  - detects real braking (2.3.48: 0.294/0.252/0.338g all
+                        registered) but also road transients
+     8 ticks  (320ms) - nothing; a 0.391g brake ignored
+     12 ticks (480ms) - nothing; a 0.518g brake ignored
+   The consecutive-sample requirement is hostile to a dithered signal, so there
+   is no usable window here. **Duration is NOT the discriminator. Do not
+   bisect this register again** - the separation is done in firmware instead,
+   by requiring a speed signature (see HarshEventDetected). 80ms stays because
+   it is the only value proven to detect braking at all.
+
+   Superseded stopping rule, kept for the reasoning:
    Noise fires at 80ms and real braking dies by 320ms would mean the two
    populations do not separate on consecutive-sample duration at all, and the
    answer moves to firmware-side gating - e.g. requiring N hraw events inside a
@@ -419,7 +433,7 @@ extern const char *TAG;
    livelock. See ISSUES.md K1. */
 
 // OTA firmware update
-#define FW_VERSION          "2.3.53"
+#define FW_VERSION          "2.3.54"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 
