@@ -1561,6 +1561,11 @@ static uint32_t harsh_event_count = 0;   // events that passed the gates - repor
    hraw > 0 with hcnt == 0 means the gates are wrong; hraw == 0 means the
    threshold or filter is wrong. */
 static uint32_t harsh_raw_count = 0;     // reported as hraw
+/* 2.3.54: events the sensor reported but that moved no vehicle - rejected for
+   having no speed signature. Reported as hnod. Read it with hraw and hcnt:
+   hraw = hnod + hcnt + (holdoff and min-speed rejects). A healthy drive should
+   show hnod well above hcnt, because road transients outnumber real events. */
+static uint32_t harsh_nodelta_count = 0; // reported as hnod
 /* Last raw INT2_SRC byte seen by the poll, so the diagnostic shows the whole
    register rather than just the result of testing bit 6. 0xFF = never read. */
 static unsigned char last_int2_src = 0xFF;
@@ -1672,10 +1677,36 @@ static void HarshEventDetected(void)
     if (peak < HARSH_MIN_SPEED) return;
     if (harsh_alarm != 0) return;          /* one alarm pending at a time */
 
+    /* 2.3.54: REQUIRE A SPEED SIGNATURE.
+       This used to fall through to hardCornering for anything without a speed
+       change, which made cornering the catch-all - and that is exactly how a
+       pothole at steady 70 km/h became an alarm. Measured on 2.3.49: of 18
+       gated events, four fired at highway speed with 0.036-0.059g of actual
+       deceleration, i.e. no deceleration at all.
+
+       The interrupt says only "threshold crossed", never by how much, so the
+       sensor cannot tell a 0.4g brake from a 0.4g jolt. The speed trend can:
+       a brake moves the vehicle, a pothole does not. This reads the track
+       history already recorded at 2-3s resolution, so it costs no I2C and no
+       faster poll - which matters, because the obvious alternative (counting
+       several interrupts in a window) cannot work here: the latch collapses
+       every crossing between two polls into one, and raising the poll rate is
+       what caused the btController livelock.
+
+       KNOWN LIMITATION - cornering is deferred, not solved. Pure cornering at
+       constant speed has no speed signature and is now rejected along with the
+       potholes. That is deliberate for v1: hardBraking and hardAcceleration
+       become trustworthy, and cornering was the one class that could never be
+       verified from GPS anyway. Re-enabling it needs a real magnitude, i.e.
+       the deferred FIFO capture, or heading change from the track buffer. */
     float ds = spd_now - spd_old;
-    harsh_alarm = (ds <= -HARSH_SPEED_DELTA) ? 1     /* hardBraking */
-                : (ds >=  HARSH_SPEED_DELTA) ? 2     /* hardAcceleration */
-                :                              3;    /* hardCornering */
+    if (ds <= -HARSH_SPEED_DELTA)      harsh_alarm = 1;   /* hardBraking */
+    else if (ds >= HARSH_SPEED_DELTA)  harsh_alarm = 2;   /* hardAcceleration */
+    else {
+        /* No speed signature: the sensor moved but the vehicle did not. */
+        harsh_nodelta_count++;
+        return;
+    }
     harsh_last_alarm_us = now;
     harsh_event_count++;
     force_ping_now = 1;
@@ -4835,10 +4866,11 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
            latency, not whether detection works.
            If hraw is still 0 after a drive where ipoll clearly climbed, the
            sensor genuinely is not triggering and the threshold is next. */
-        snprintf(h_part, sizeof(h_part), "&hmin=%lu&hcnt=%lu&hraw=%lu&ipoll=%lu&qpoll=%lu&apoll=%lu",
+        snprintf(h_part, sizeof(h_part), "&hmin=%lu&hcnt=%lu&hraw=%lu&hnod=%lu&ipoll=%lu&qpoll=%lu&apoll=%lu",
                  (unsigned long)esp_get_minimum_free_heap_size(),
                  (unsigned long)harsh_event_count,
                  (unsigned long)harsh_raw_count,
+                 (unsigned long)harsh_nodelta_count,
                  (unsigned long)int1_poll_count,
                  (unsigned long)ping_poll_count,
                  (unsigned long)accel_poll_count);
