@@ -243,7 +243,33 @@ interrupt in 51 h, so `ParkLongTimer` genuinely reached `PARK_LONG_SECONDS`.
 `uint64_t wakeup_time_sec`, so `7200 * 1000000` is a 64-bit multiply — 7.2e9 is fine.
 Both `esp_sleep_enable_timer_wakeup()` (line 205) and the GPIO wake (line 245) are armed.
 
-**Two hypotheses, indistinguishable from server data:**
+**RESOLVED 2026-08-13: hypothesis 1. THE TIMER WAKE NEVER FIRES.**
+
+The fast-cycle diagnostic build (`2.3.55-diag1`, `PARK_LONG_SECONDS` 900 s /
+`HEART_BEAT_INTERVAL` 300 s, branch `diag/deepsleep-fast`) settled it in one afternoon.
+Unit 2 crossed the gate and then:
+
+```
+10:13:40  up=967    <- slept (past the 900 s gate)
+   ... 9 h 19 m of silence, ~112 missed 5-minute heartbeats ...
+19:32:41  up=56     <- fresh boot, only after physical disturbance
+```
+
+112 consecutive misses at a 5-minute interval is not a timing margin problem. The timer is
+armed (`DeepSleep.c:205`) and never fires. All three units reproduced it.
+
+**Prime suspect: the sleep power-domain configuration.** On the ESP32-C3 the GPIO wake uses
+`esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown()` (`DeepSleep.c:245`), and that
+"hp periph powerdown" sleep mode plausibly powers down the domain the RTC timer needs. The
+symptom fits exactly: GPIO wake works, timer wake does not. **Next step is to test the two
+wake sources in isolation** - a build with the GPIO wake removed, to see whether the timer
+alone fires. If it does, the two are mutually exclusive as currently configured and the fix
+is to select a sleep mode that retains the RTC timer domain (or to accept motion-only wake
+and drop the heartbeat claim from the docs).
+
+This is a power-domain fix, NOT the cheap re-sleep fix - hypothesis 2 below is disproven.
+
+**Superseded - the two hypotheses this build was written to separate:**
 
 1. **The timer wake never fires.** On the ESP32-C3 the GPIO wake uses
    `esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown()`, and if that sleep
@@ -270,6 +296,22 @@ carrying other changes, and motion wake is proven as the recovery path.
 to enter a state you cannot leave is strictly worse than the bug it fixes. **2.3.52's
 motion-confirmation change must not go to production, and must not go near the van, until
 D2 is resolved.** Both are currently staging-only, which is where they should stay.
+
+**Operational consequence while D2 is open:** deep sleep is effectively a motion-only
+state. Any unit left genuinely undisturbed past `PARK_LONG_SECONDS` goes dark until
+somebody moves it - so a vehicle parked over a long weekend stops reporting, and looks
+identical to a stolen/disconnected unit. Consider whether `PARK_LONG_SECONDS` should be
+raised or deep sleep disabled outright on field units until the timer wake works.
+
+**Incident 2026-08-13, worth recording because the recovery is not obvious:** all three
+units, INCLUDING THE VAN, ended up on `2.3.55-diag1` with its 15-minute gate and all three
+went dark. Cause was procedural, not technical - the van was still subscribed to the
+staging channel (`otach=1`) from an earlier `V_OTA_TEST`, so it pulled the deliberately
+unsafe diagnostic build on its next periodic check. **Recovery that worked without any
+command: publish a SAFE build to staging.** `CheckAndApplyOTA()` runs at boot, so the
+moment motion wakes a unit it pulls the safe version by itself. That is the fastest fix
+for a fleet stranded on a bad staging build - faster than trying to command devices that
+are asleep and cannot receive commands. See the staging guardrail in CLAUDE.md.
 
 **Also corrects the D1 write-up:** D1 claims the 48 h gate is "unreachable anywhere a
 vehicle actually parks". This proves that is too strong — unit 3 reached it on the
