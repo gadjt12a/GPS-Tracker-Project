@@ -215,10 +215,83 @@ lacks `-mtune=esp-base`. Fix documented in CLAUDE.md.
 
 ## D. Power management
 
+### D2 — Deep sleep is a ONE-WAY TRIP: the 2 h timer heartbeat never reports
+**P1 · OPEN · observed 2026-08-12/13 on unit 3 · blocks shipping the D1 fix**
+
+A device that enters deep sleep goes dark until something physically moves it. Motion
+wake works; the timer heartbeat does not.
+
+**Field evidence (unit 3, bench, 2.3.51, undisturbed on a garage PSU):**
+
+| Event | Time (UTC) | uptime |
+|---|---|---|
+| Last normal 5-min ping | 2026-08-12 07:36:25 | 184831 (51.3 h) |
+| — silence, **~11 missed 2 h heartbeats** — | | |
+| Reported in after being **shaken by hand** | 2026-08-13 06:30:41 | 3185 (reboot) |
+
+**22.9 hours, zero pings.** The 5-minute cadence was perfectly regular right up to the
+stop, the last ping was healthy (`vbat=12.608`, `ncsq=28,99`), and `ipoll=1` — one motion
+interrupt in 51 h, so `ParkLongTimer` genuinely reached `PARK_LONG_SECONDS`.
+
+| Path | Status |
+|---|---|
+| Entering deep sleep at 48 h | works |
+| GPIO / motion wake (INT1) | **works** — a hand shake brought it back |
+| 2 h timer heartbeat | **broken** |
+
+**Ruled out:** arithmetic overflow in the timer arm. `DeepSleep.c:202-203` uses
+`uint64_t wakeup_time_sec`, so `7200 * 1000000` is a 64-bit multiply — 7.2e9 is fine.
+Both `esp_sleep_enable_timer_wakeup()` (line 205) and the GPIO wake (line 245) are armed.
+
+**Two hypotheses, indistinguishable from server data:**
+
+1. **The timer wake never fires.** On the ESP32-C3 the GPIO wake uses
+   `esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown()`, and if that sleep
+   configuration powers down the domain the RTC timer needs, the timer can never wake it.
+   Would explain GPIO working and timer not, exactly.
+2. **The timer wake fires but the device re-sleeps before it can report.** On a heartbeat
+   wake `app_main` sets `ParkLongTimer = PARK_LONG_SECONDS` and `heartbeat_wake = 1`, so
+   the deep-sleep gate is *already satisfied* the moment it boots. A cold modem needs
+   ~30-90 s to register (measured TTFF is far worse). If `DeepSleep()` is reached before
+   the first ping completes, the device sleeps again having sent nothing — 11 times over.
+
+**Do NOT guess between these.** Both produce identical silence.
+
+**Decisive test — use the staging channel.** Build a diagnostic rc with
+`HEART_BEAT_INTERVAL` 300 s and `PARK_LONG_SECONDS` ~900 s so a full sleep/wake cycle
+takes ~20 minutes instead of 50 hours, and put it on **unit 3** via `Moved V_OTA_TEST`.
+Pings appearing at ~5-minute intervals means hypothesis 2 (and the fix is to hold off
+sleep until the heartbeat ping has been sent or definitively failed). Continued silence,
+broken only by shaking, means hypothesis 1 (and the fix is in the sleep power-domain
+config). Unit 3 is the right target: it is on the bench, it is the D1 control so it is not
+carrying other changes, and motion wake is proven as the recovery path.
+
+**BLOCKS D1 / 2.3.52.** The D1 fix makes the 48 h gate *easier* to reach. Making it easier
+to enter a state you cannot leave is strictly worse than the bug it fixes. **2.3.52's
+motion-confirmation change must not go to production, and must not go near the van, until
+D2 is resolved.** Both are currently staging-only, which is where they should stay.
+
+**Also corrects the D1 write-up:** D1 claims the 48 h gate is "unreachable anywhere a
+vehicle actually parks". This proves that is too strong — unit 3 reached it on the
+unmodified logic with `ipoll=1` over 51 h. The gate is **environment-dependent**, not
+unreachable: the same bench measured 0.85 assertions/hour in one week and ~0.02/hour the
+next. D1 is still a real defect (one stray knock discarding 48 h of stillness is wrong),
+but the failure is "unreliable", not "impossible".
+
+
+
 ### D1 — Deep sleep can never engage: any single motion interrupt resets the 48 h counter
 **P2 · CONFIRMED 2026-08-09 on two undisturbed bench units · mechanism located in code**
 
-**The 48 h deep-sleep gate is effectively unreachable in any environment with occasional
+**CORRECTED 2026-08-13 — see D2.** "Unreachable" was too strong. Unit 3 reached the gate on
+the *unmodified* logic and slept, with `ipoll=1` over 51 h. The gate is
+**environment-dependent**: the same bench measured 0.85 assertions/hour one week and
+~0.02/hour the next. The defect below is real — one stray knock should not discard 48 h of
+accumulated stillness — but the failure mode is "unreliable", not "impossible".
+**The fix is also currently BLOCKED by D2:** deep sleep is a one-way trip until the timer
+heartbeat works, so making the gate easier to reach is actively harmful.
+
+**The 48 h deep-sleep gate is unreliable in any environment with occasional
 vibration.** This is a design fragility, not a tuning problem.
 
 `main.c:3287-3291`, on every pass where the INT1 pin reads asserted:
