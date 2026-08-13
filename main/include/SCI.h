@@ -200,8 +200,8 @@ extern const char *TAG;
 #define IGNITION_OFF_DEBOUNCE    15
 
 #define TIME_TO_SLEEP 300
-#define PARK_LONG_SECONDS 172800UL   // 48 hours â€” threshold to enter deep sleep
-#define HEART_BEAT_INTERVAL (2*3600) // 2hr deep-sleep heartbeat wakeup — each wake also delivers queued Traccar commands (~30mAh/day on vehicle battery)
+#define PARK_LONG_SECONDS 900UL      // DIAG ONLY (was 172800 = 48h) - 15 min so a sleep/wake cycle is observable
+#define HEART_BEAT_INTERVAL (300)    // DIAG ONLY (was 2*3600) - 5 min heartbeat to test D2
 
 // Harsh driving detection (Phase 7b) — horizontal-plane g thresholds.
 // 0.4g = industry consensus for fleet products (DOT harsh = 0.45g); tune from
