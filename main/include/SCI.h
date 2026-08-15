@@ -356,7 +356,27 @@ extern const char *TAG;
 #define HARSH_RESET_G       0.25f   // UNUSED - leftover from the pre-2.3.37 software sampler
 #define HARSH_ACCIDENT_G    1.85f   // near-clip spike = accident (stage 2, see below)
 #define HARSH_HOLDOFF_S     15      // min gap between harsh alarms
-#define HARSH_SPEED_DELTA   6.0f    // km/h change over 2s that classifies braking/accel vs cornering
+/* 2.3.56: 6.0 -> 15.0. This constant changed JOB in 2.3.54 and the old value
+   did not follow. It was written to *classify* an event (braking vs
+   acceleration vs cornering), where 6 km/h is a sensible dividing line. Since
+   2.3.54 it also *rejects* - an event that clears neither direction is thrown
+   away as a road transient - and as a rejection threshold 6 km/h over the
+   HARSH_SPD_HIST 4s window is only 0.042g. That is far too permissive: the
+   worst false positive on the 2026-08-13 drive measured 0.043g (69.9 -> 65.4
+   km/h), clearing the bar almost exactly.
+
+   15 km/h over 4s is ~0.106g average. Checked against every accepted event on
+   that drive: it keeps all four >=0.25g brakes (which showed 32-36 km/h drops)
+   and the six mid-band events, and rejects the four weakest - 4.5, 7.4, 8.5
+   and 8.5 km/h. 10 of 14 survive, and the ones lost are the ones with no
+   deceleration worth reporting.
+
+   Averaging note: ds is measured over the full 4s history, so a sharp 2s brake
+   is UNDERSTATED here - a 32 km/h drop in 2s reads as 32 over 4s only if the
+   vehicle stays slow. That is the safe direction (it under-rejects), but it is
+   why this is not simply "0.106g". Do not convert this constant to a g figure
+   and tune it as if it were an accelerometer threshold. */
+#define HARSH_SPEED_DELTA   15.0f   // km/h over HARSH_SPD_HIST: classifies AND rejects (2.3.56)
 #define HARSH_MIN_SPEED     15.0f   // ignore events when peak involved speed below this (door slams etc.)
 
 /* Hardware register values, derived from the thresholds above so the two can
@@ -433,7 +453,10 @@ extern const char *TAG;
    livelock. See ISSUES.md K1. */
 
 // OTA firmware update
-#define FW_VERSION          "2.3.54"
+/* 2.3.55 was consumed by the D2 deep-sleep diagnostic (2.3.55-diag1, branch
+   diag/deepsleep-fast, staging only, never released). Skipped here so the
+   number cannot be confused with a fleet release. */
+#define FW_VERSION          "2.3.56"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 
