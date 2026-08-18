@@ -375,7 +375,24 @@ extern const char *TAG;
    is UNDERSTATED here - a 32 km/h drop in 2s reads as 32 over 4s only if the
    vehicle stays slow. That is the safe direction (it under-rejects), but it is
    why this is not simply "0.106g". Do not convert this constant to a g figure
-   and tune it as if it were an accelerometer threshold. */
+   and tune it as if it were an accelerometer threshold.
+
+   2.3.57 - DO NOT TRUST THE ANALYSIS ABOVE. Every measurement it rests on was
+   taken while HarshSpeedTick was zero-filling the history on any GPS gap over
+   10s (fixed in 2.3.57 - see the comment on that function). A fabricated 0 for
+   spd_old makes ds large and POSITIVE, so events were pushed across this
+   threshold that should never have cleared it, and the drive used to justify
+   15.0 cannot distinguish a real 32 km/h brake from a transient that happened
+   to land after a ping boundary. The value is LEFT AT 15.0 deliberately: it is
+   one variable, and changing it in the same build as the zero-fill fix would
+   make the result unreadable. Re-measure on clean data before touching it.
+
+   Known counter-evidence already, from the van on 2026-08-18: a real
+   acceleration (60.7 -> 91.5 km/h over 21s) was rejected because any 4s window
+   across it shows only ~+6 km/h. Sustained real-world vehicle acceleration is
+   0.04-0.09g, well under the ~0.106g this represents, so the window length may
+   be the wrong lever rather than the number. Do not "fix" that by raising
+   HARSH_SPD_HIST without re-reading the averaging note above. */
 #define HARSH_SPEED_DELTA   15.0f   // km/h over HARSH_SPD_HIST: classifies AND rejects (2.3.56)
 #define HARSH_MIN_SPEED     15.0f   // ignore events when peak involved speed below this (door slams etc.)
 
@@ -456,7 +473,7 @@ extern const char *TAG;
 /* 2.3.55 was consumed by the D2 deep-sleep diagnostic (2.3.55-diag1, branch
    diag/deepsleep-fast, staging only, never released). Skipped here so the
    number cannot be confused with a fleet release. */
-#define FW_VERSION          "2.3.56"
+#define FW_VERSION          "2.3.57"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 
