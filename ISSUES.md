@@ -113,6 +113,92 @@ moment Valetron ships a modem update.
 
 ---
 
+## H. Harsh driving (Phase 7b)
+
+### H1 — Speed history zero-fill inverted the sign of every post-gap event
+**P1 · FIXED in 2.3.57 · introduced in 2.3.54 · found on the van 2026-08-18**
+
+`HarshSpeedTick()` wrote `0.0f` into the classification ring whenever the track speed was
+more than 10 s old — reporting "stopped" when it meant "unknown". The GPS second only
+advances when `XCheckGPS()` polls the modem, and a ping cycle blocks that for 11–21 s, so
+**every ping boundary zeroed the history.**
+
+The effect is a sign inversion, not a small error. After a gap the ring reads
+`[0,0,0,<fresh>]`, so `spd_old` is a fabricated 0 and `ds = spd_now - spd_old` is large and
+**positive** regardless of what the vehicle did.
+
+Field evidence, van, single drive 2026-08-18:
+
+| NZST | reality | reported |
+|---|---|---|
+| 11:49:45 | road transient, 16 s GPS gap before it | **false positive** `hardAcceleration` |
+| 11:53:06 | real brake, 68.8 → 28.5 km/h across a 13 s gap | delivered, **mislabelled** `hardAcceleration` |
+
+Because `HARSH_SPEED_DELTA` is the *only* noise rejection this design has, a zeroed
+`spd_old` defeats it completely — a fabricated 0 guarantees the gate is cleared.
+
+**Consequence beyond the bug: every measurement used to tune `HARSH_SPEED_DELTA` across
+2.3.54–2.3.56 was taken against corrupt data**, including the 6 → 15 raise in 2.3.56 and
+the "62% of events rejected" result. Both need re-measuring. The true rejection rate is
+*higher* than measured, and some delivered alarms were artefacts.
+
+**Fix (2.3.57):** parallel `harsh_spd_valid[]` flags — 0 is a legitimate speed and cannot
+double as the "no sample" marker. An event landing on invalid history is discarded and
+counted as **`hstl`**, distinct from `hnod`: `hnod` means "we looked and the vehicle did not
+move", `hstl` means "we could not tell". `HARSH_SPEED_DELTA` deliberately left at 15.0 so
+this build moves one variable.
+
+### H2 — Cornering is not detected by the sensor at all, not merely unclassifiable
+**P2 · OPEN · corrects a documented assumption**
+
+The project has recorded cornering as *deferred because it has no speed signature* — i.e. a
+**classification** problem, on the assumption the sensor fires and the classifier then has
+nothing to work with. Field data says the failure is upstream of that.
+
+Van, 2026-08-18, a roundabout entered firmly at ~30–49 km/h with a left/right/left/right
+through it (heading swings 161° → 235° → 203°, ts 1787010778–1787010792):
+
+| NZST | `hraw` | `hnod` | `ipoll` |
+|---|---|---|---|
+| 11:53:06 | 28 | 16 | 857 |
+| 11:53:38 | **28** | 16 | 865 |
+| 11:54:11 | **28** | 16 | 873 |
+| 11:55:10 | **28** | 16 | 888 |
+
+`hraw` is counted before *all* gating, and all three `INT2_SRC` read sites (`main.c:1114`,
+`4460`, `7830`) test bit 6 before discarding, so nothing silently eats the latch. `ipoll`
+climbed +41 across the same window, so INT1 was asserting and the poll was alive — that is
+generator 1 (motion wake). **Generator 2 never crossed threshold.**
+
+So fixing the classifier would not recover these events; there is nothing to classify.
+`INT2_CFG` is `0x0A` = XHIE|YHIE, so the horizontal plane *is* being watched.
+
+**GPS cannot settle whether 0.25 g was reached**, and the gap falls in the worst place:
+no samples between ts=1787010778 and ts=1787010787, a 9 s hole across the sharpest part.
+Using `a = v·ω` on the 74° swing at ~35 km/h — **0.14 g** if the turn filled all 9 s,
+**0.32 g** if it took 4 s. The threshold is 0.25 g; the answer straddles it.
+
+This is field evidence for the deferred **LIS3DH FIFO Stream-to-FIFO capture** rather than
+another threshold guess. Do not tune `HARSH_EVENT_G` at this — both hardware levers are
+already closed for braking, and lowering it to chase cornering would reopen the road-noise
+problem that 2.3.49 and 2.3.54 spent four builds closing.
+
+### H3 — `HARSH_SPEED_DELTA` may be rejecting real events; the window is the suspect
+**P2 · OPEN**
+
+Same drive, 11:50:49: a real acceleration from 60.7 → 91.5 km/h fired the sensor
+(`hraw` 26 → 27) and was **rejected** as `hnod` — `spd_now` 91.5, `spd_old` ≈ 90.5,
+`ds = +1.0`. The acceleration was genuine and strong but spread over 21 s, so any 4 s
+window sees only ~+6 km/h.
+
+15 km/h over `HARSH_SPD_HIST` (4 s) is ~0.106 g. Sustained real-world vehicle acceleration
+and moderate braking sit at **0.02–0.09 g**, while the sensor triggers on a 0.25 g / 80 ms
+*transient*. The two are measuring different physics, so the **window length may be the
+wrong lever rather than the number**. Blocked on H1 — there is no sound basis for choosing
+either until the history is trustworthy.
+
+---
+
 ## B. Known / previously documented
 
 ### K1 — btController livelock with `HarshDriveTask`

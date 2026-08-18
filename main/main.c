@@ -1567,6 +1567,10 @@ static void PowerSenseTick(void)
    from the track-derived speed we already maintain: no sensor access, no
    allocation, no I2C. */
 static float    harsh_spd_hist[HARSH_SPD_HIST] = {0};
+/* 2.3.57: parallel validity flags. Zero is a legitimate speed (a stopped
+   vehicle), so it cannot double as the "no sample" marker - conflating the two
+   is exactly what broke the classifier. */
+static unsigned char harsh_spd_valid[HARSH_SPD_HIST] = {0};
 static int      harsh_spd_idx = 0;
 static int64_t  harsh_last_alarm_us = 0;
 static uint32_t harsh_event_count = 0;   // events that passed the gates - reported as hcnt
@@ -1582,6 +1586,13 @@ static uint32_t harsh_raw_count = 0;     // reported as hraw
    hraw = hnod + hcnt + (holdoff and min-speed rejects). A healthy drive should
    show hnod well above hcnt, because road transients outnumber real events. */
 static uint32_t harsh_nodelta_count = 0; // reported as hnod
+/* 2.3.57: events discarded because the speed history was not trustworthy at the
+   moment they fired - see HarshSpeedTick. Reported as hstl. These are NOT the
+   same as hnod: hnod means "we looked and the vehicle did not move", hstl means
+   "we could not tell". Keeping them apart is the whole point, because 2.3.54
+   through 2.3.56 silently merged the second case into the first and got a wrong
+   answer both ways round. */
+static uint32_t harsh_stale_count = 0;   // reported as hstl
 /* Last raw INT2_SRC byte seen by the poll, so the diagnostic shows the whole
    register rather than just the result of testing bit 6. 0xFF = never read. */
 static unsigned char last_int2_src = 0xFF;
@@ -1647,24 +1658,61 @@ static void HarshRegReadback(char *out, size_t len)
              last_int2_src);
 }
 
-/* Called once per second from the timer tick. */
+/* Called once per second from the timer tick.
+
+   2.3.57 - THE ZERO-FILL BUG. This used to write 0.0f whenever the track speed
+   was older than 10s, i.e. it reported "stopped" when it meant "unknown". The
+   GPS second only advances when XCheckGPS polls the modem, and a ping cycle
+   blocks that for 11-21s (see the track-resolution notes), so EVERY ping
+   boundary drove the history to zero.
+
+   The consequence was not a small error, it was a sign inversion. After a gap
+   the ring reads [0,0,0,<fresh sample>], so spd_old is a fabricated 0 and
+   ds = spd_now - spd_old is a large POSITIVE number regardless of what the
+   vehicle actually did. Measured on the van 2026-08-18: a genuine brake from
+   68.8 to 28.5 km/h across a 13s gap was delivered as alarm=hardAcceleration,
+   and a road transient after a 16s gap became an alarm that should never have
+   passed the delta gate at all. Because the gate is the ONLY noise rejection
+   this design has, a zeroed spd_old defeats it completely - which also means
+   every measurement used to tune HARSH_SPEED_DELTA in 2.3.54-2.3.56 was taken
+   against corrupt data.
+
+   The fix is to stop inventing a number. A stale sample marks the slot invalid,
+   and an event that lands on invalid history is discarded (counted as hstl)
+   rather than classified from fiction. Discarding is the conservative choice:
+   the alternative - holding the last known speed - would keep ds near zero and
+   quietly file real events as hnod, hiding the problem instead of measuring it. */
 static void HarshSpeedTick(void)
 {
-    float spd = (track_live_speed_us != 0 &&
-                 esp_timer_get_time() - track_live_speed_us <= 10LL * 1000000LL)
-                    ? track_live_speed_kmh : 0.0f;
-    harsh_spd_hist[harsh_spd_idx] = spd;
+    int fresh = (track_live_speed_us != 0 &&
+                 esp_timer_get_time() - track_live_speed_us <= 10LL * 1000000LL);
+    harsh_spd_hist[harsh_spd_idx]  = fresh ? track_live_speed_kmh : 0.0f;
+    harsh_spd_valid[harsh_spd_idx] = fresh ? 1 : 0;
     harsh_spd_idx = (harsh_spd_idx + 1) % HARSH_SPD_HIST;
+}
+
+static int harsh_speed_idx_now(void)
+{
+    return (harsh_spd_idx + HARSH_SPD_HIST - 1) % HARSH_SPD_HIST;
 }
 
 static float harsh_speed_now(void)
 {
-    return harsh_spd_hist[(harsh_spd_idx + HARSH_SPD_HIST - 1) % HARSH_SPD_HIST];
+    return harsh_spd_hist[harsh_speed_idx_now()];
 }
 
 static float harsh_speed_ago(void)   /* oldest entry, ~HARSH_SPD_HIST seconds back */
 {
     return harsh_spd_hist[harsh_spd_idx];
+}
+
+/* Both ends of the window must be real samples for the delta to mean anything.
+   Only the two ends are checked, not the whole ring: they are the only entries
+   ds is computed from, and requiring every slot to be fresh would reject far
+   more than necessary given the 2-3s GPS cadence feeding a 1Hz tick. */
+static int harsh_speed_trustworthy(void)
+{
+    return harsh_spd_valid[harsh_speed_idx_now()] && harsh_spd_valid[harsh_spd_idx];
 }
 
 /* Called from StartMainTask when the INT1 pin is asserted and INT2_SRC shows
@@ -1683,6 +1731,14 @@ static void HarshEventDetected(void)
     /* Holdoff stops one rough stretch of road producing a burst of alarms. */
     if (now - harsh_last_alarm_us <= (int64_t)HARSH_HOLDOFF_S * 1000000LL)
         return;
+
+    /* 2.3.57: no trustworthy speed context means no classification. This is
+       checked before the min-speed gate below, because that gate reads the same
+       history and a fabricated 0 would have failed it for the wrong reason. */
+    if (!harsh_speed_trustworthy()) {
+        harsh_stale_count++;
+        return;
+    }
 
     float spd_now = harsh_speed_now();
     float spd_old = harsh_speed_ago();
@@ -4910,11 +4966,12 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
            latency, not whether detection works.
            If hraw is still 0 after a drive where ipoll clearly climbed, the
            sensor genuinely is not triggering and the threshold is next. */
-        snprintf(h_part, sizeof(h_part), "&hmin=%lu&hcnt=%lu&hraw=%lu&hnod=%lu&ipoll=%lu&qpoll=%lu&apoll=%lu",
+        snprintf(h_part, sizeof(h_part), "&hmin=%lu&hcnt=%lu&hraw=%lu&hnod=%lu&hstl=%lu&ipoll=%lu&qpoll=%lu&apoll=%lu",
                  (unsigned long)esp_get_minimum_free_heap_size(),
                  (unsigned long)harsh_event_count,
                  (unsigned long)harsh_raw_count,
                  (unsigned long)harsh_nodelta_count,
+                 (unsigned long)harsh_stale_count,
                  (unsigned long)int1_poll_count,
                  (unsigned long)ping_poll_count,
                  (unsigned long)accel_poll_count);
