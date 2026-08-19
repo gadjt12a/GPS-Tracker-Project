@@ -239,6 +239,14 @@ void EnterDeepSleep(void)
 
 #ifdef CONFIG_EXAMPLE_GPIO_WAKEUP
     #if SOC_GPIO_SUPPORT_HP_PERIPH_PD_SLEEP_WAKEUP
+    #ifdef D2_NO_GPIO_WAKE
+        /* D2 EXPERIMENT (ISSUES.md D2) - GPIO wake deliberately NOT armed, so
+           the timer wake can be tested in isolation. See the D2_NO_GPIO_WAKE
+           block in SCI.h for the hypothesis and how to read the result.
+           With this compiled in, motion CANNOT wake the unit - recovery is a
+           physical power-cycle. Never publish to production. */
+        ESP_LOGW(TAG,"D2 DIAG: GPIO wakeup NOT armed - timer wake only, motion will NOT wake this unit\n");
+    #else
     {
         /* ESP32-C3: use hp-periph-powerdown GPIO wakeup for deep sleep.
            LIS3DH INT1 is active-low, so wake on GPIO going LOW. */
@@ -246,6 +254,7 @@ void EnterDeepSleep(void)
             BIT(DEFAULT_WAKEUP_PIN), DEFAULT_WAKEUP_LEVEL));
         ESP_LOGI(TAG,"Enabling deep sleep GPIO wakeup on pin GPIO%d (INT1, active low)\n", DEFAULT_WAKEUP_PIN);
     }
+    #endif // D2_NO_GPIO_WAKE
     #endif // SOC_GPIO_SUPPORT_HP_PERIPH_PD_SLEEP_WAKEUP
 
 

@@ -203,6 +203,39 @@ extern const char *TAG;
 #define PARK_LONG_SECONDS 900UL      // DIAG ONLY (was 172800 = 48h) - 15 min so a sleep/wake cycle is observable
 #define HEART_BEAT_INTERVAL (300)    // DIAG ONLY (was 2*3600) - 5 min heartbeat to test D2
 
+/* ===================== D2 EXPERIMENT - NEVER PUBLISH TO PRODUCTION =========
+   ISSUES.md D2: deep sleep is a one-way trip. On the fast-cycle build above,
+   unit 2 slept and stayed dark 9h19m across ~112 missed 5-minute heartbeats.
+   Only motion brings a sleeping unit back.
+
+   The standing hypothesis is that the ESP32-C3's
+   `esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown()` powers down the RTC
+   timer domain as a side effect, so arming GPIO wake silently disarms the
+   timer. The two wake sources would then be mutually exclusive rather than
+   additive - which is exactly what the field data looks like.
+
+   Only two wake sources are actually compiled in. EXT0 and EXT1 are dead code
+   here: CONFIG_EXAMPLE_EXT0_WAKEUP / _EXT1_WAKEUP are defined nowhere in the
+   tree or in sdkconfig, so those blocks preprocess away. What remains is
+   `esp_sleep_enable_timer_wakeup()` (unconditional) and the GPIO call above,
+   which is enabled by a LOCAL `#define CONFIG_EXAMPLE_GPIO_WAKEUP` at
+   DeepSleep.c:52 - NOT from sdkconfig. Checking sdkconfig alone suggests GPIO
+   wake is off; it is not.
+
+   Defining D2_NO_GPIO_WAKE removes the GPIO arm and leaves the timer alone,
+   testing the timer in isolation. This is the ONLY difference from the build
+   that demonstrated the failure, so the result is readable on its own:
+
+     unit reports every ~5 min indefinitely -> the two sources ARE mutually
+       exclusive. The fix is the sleep power-domain config, and deep sleep can
+       be made safe without giving up motion wake.
+     unit still goes dark -> the timer arm itself is broken and GPIO is a red
+       herring. Look at esp_sleep_enable_timer_wakeup and the RTC clock source.
+
+   THE UNIT CANNOT WAKE ON MOTION WITH THIS BUILD. That is the point, and it
+   means recovery is a physical power-cycle, not a shake. Bench only. */
+#define D2_NO_GPIO_WAKE
+
 // Harsh driving detection (Phase 7b) — horizontal-plane g thresholds.
 // 0.4g = industry consensus for fleet products (DOT harsh = 0.45g); tune from
 // the gmax attribute once field data accumulates. Accident capped just under

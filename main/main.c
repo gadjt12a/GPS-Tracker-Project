@@ -544,6 +544,20 @@ static uint32_t motion_window_left = 0;  // seconds remaining in that window
 static unsigned short motion_last_second = 0; // de-dupes passes of one latched event
 static uint32_t park_reset_count   = 0;  // times motion was CONFIRMED (reported as pltr)
 static int heartbeat_wake = 0;   // 1 when woken by 8hr timer; cleared after first ping
+
+/* D2 EXPERIMENT (ISSUES.md D2) - reported as `wake` on every ping.
+   The wake cause is currently only ESP_LOGged, which is useless here: the whole
+   question is what a unit sitting on a bench with no serial attached did after
+   it slept. Without this, "it came back" cannot be separated from "someone
+   knocked the bench", and on the previous D2 run that ambiguity is precisely
+   what had to be ruled out by leaving the unit alone for 9 hours.
+     0 = cold boot / power-on      1 = deep-sleep TIMER wake  <-- the result we want
+     2 = deep-sleep GPIO wake      3 = deep sleep, other cause
+     4 = software reset (OTA, V_RESET, panic)
+   Sticky for the life of the boot, so it is readable on every ping rather than
+   only the first - which matters because the first ping after a wake is the one
+   most likely to be lost to a marginal network. */
+static int wake_cause_code = 0;
 uint32_t ota_check_timer = 0;   // seconds since last OTA check; 24hr periodic check
 float last_good_lat = 0.0f; // last GPS fix — persisted to NVS, survives reboots
 float last_good_lon = 0.0f;
@@ -5005,8 +5019,15 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         snprintf(plt_part, sizeof(plt_part), "&plt=%lu&pltr=%lu",
                  (unsigned long)ParkLongTimer, (unsigned long)park_reset_count);
 
+        /* D2 EXPERIMENT - see wake_cause_code. Emitted on EVERY ping, not just
+           the first after a wake, because the first ping is the one most likely
+           to be lost to a marginal network and losing it would cost the whole
+           run. `wake=1` on a unit that has just slept is the result. */
+        char wake_part[16] = "";
+        snprintf(wake_part, sizeof(wake_part), "&wake=%d", wake_cause_code);
+
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s%s%s%s%s&fwver=" FW_VERSION,
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s%s%s%s%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed / 1.852f, // OsmAnd speed param is knots
         ts_part,
@@ -5023,6 +5044,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         ota_part,
         och_part,
         plt_part,
+        wake_part,
         _alarm);
     }
     Print("AT+HTTPPARA=\"URL\",\"");
@@ -9021,6 +9043,26 @@ void app_main(void)
         (esp_sleep_get_wakeup_causes() & (1ULL << ESP_SLEEP_WAKEUP_TIMER))) {
         ParkLongTimer = PARK_LONG_SECONDS;
         heartbeat_wake = 1;
+    }
+
+    /* D2 EXPERIMENT - classify the wake for telemetry (see wake_cause_code).
+       Gated on ESP_RST_DEEPSLEEP for the same reason as the block above: the
+       wakeup-cause register survives a software reset, so after an OTA reboot
+       it still reads TIMER and would report a deep-sleep wake that never
+       happened. That stale bit already caused one real bug (phantom deep
+       sleep after OTA), so it is not a hypothetical. */
+    {
+        esp_reset_reason_t rr = esp_reset_reason();
+        if (rr == ESP_RST_DEEPSLEEP) {
+            uint64_t causes = esp_sleep_get_wakeup_causes();
+            if (causes & (1ULL << ESP_SLEEP_WAKEUP_TIMER))     wake_cause_code = 1;
+            else if (causes & (1ULL << ESP_SLEEP_WAKEUP_GPIO)) wake_cause_code = 2;
+            else                                               wake_cause_code = 3;
+        } else if (rr == ESP_RST_SW || rr == ESP_RST_PANIC || rr == ESP_RST_TASK_WDT) {
+            wake_cause_code = 4;
+        } else {
+            wake_cause_code = 0;   // power-on / cold boot
+        }
     }
     // osDelay(5000);
     // DisableGSM();
