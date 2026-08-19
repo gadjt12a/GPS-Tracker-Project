@@ -1577,6 +1577,54 @@ static uint32_t harsh_nodelta_count = 0; // reported as hnod
    through 2.3.56 silently merged the second case into the first and got a wrong
    answer both ways round. */
 static uint32_t harsh_stale_count = 0;   // reported as hstl
+
+/* 2.3.58 - PER-EVENT LOG FOR H3 (ISSUES.md H3). DIAGNOSTIC, NOT A FEATURE.
+   The aggregate counters say how many events took each exit, never WHEN. A
+   ping covers ~31s and the GPS trace runs at 2-3s, so an event rejected as
+   hnod cannot be placed against the speed trace it was judged on: the
+   2026-08-19 analysis found a genuine 0.334g decel inside an hnod window and
+   could not tell whether that event was the one rejected or a separate
+   transient beside it. Two readings, opposite conclusions, no way to choose.
+
+   Recording the uptime of each event resolves it, because the track buffer is
+   already timestamped - the event can be laid directly over the speed trace
+   and the true delta recomputed over ANY window length offline. That is
+   precisely the H3 question (is 4s the wrong window, rather than 15 km/h the
+   wrong number?), and it is answerable from one drive instead of a bisection
+   per candidate window.
+
+   ds is logged with the event because it is what the gate actually compared;
+   recomputing it from delivered samples is not the same number, since the ring
+   holds 1Hz ticks and only some become track samples.
+
+   Costs no I2C and no extra poll - array writes on a path that already runs.
+   Deliberately NOT a printf: that was a livelock suspect (ISSUES.md K1). */
+#define HARSH_EVLOG_MAX  6   // events retained between pings; hraw moves <=4 in practice
+typedef struct {
+    uint32_t t_s;    // uptime in seconds when the event fired
+    int16_t  ds_x10; // spd_now - spd_old, km/h x10; 0 when never computed (S/H)
+    char     disp;   // disposition - see HarshEvLog()
+} harsh_ev_t;
+static harsh_ev_t harsh_evlog[HARSH_EVLOG_MAX];
+static unsigned char harsh_evlog_n = 0;   // entries used; saturates, oldest kept
+static uint32_t harsh_evlog_lost = 0;     // events dropped because the ring was full
+
+/* Disposition codes, one per exit in HarshEventDetected:
+     B braking alarm     A acceleration alarm
+     N no speed delta    S stale/untrustworthy history
+     H holdoff           M below min speed    P alarm already pending
+   H and M were previously invisible - hraw minus the three counters implied
+   them but never separated them, and the 2026-08-19 drive happened to have
+   zero of both, which is exactly the case that hides a miscount. */
+static void HarshEvLog(char disp, float ds)
+{
+    if (harsh_evlog_n >= HARSH_EVLOG_MAX) { harsh_evlog_lost++; return; }
+    harsh_evlog[harsh_evlog_n].t_s    = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    harsh_evlog[harsh_evlog_n].ds_x10 = (int16_t)(ds * 10.0f);
+    harsh_evlog[harsh_evlog_n].disp   = disp;
+    harsh_evlog_n++;
+}
+
 /* Last raw INT2_SRC byte seen by the poll, so the diagnostic shows the whole
    register rather than just the result of testing bit 6. 0xFF = never read. */
 static unsigned char last_int2_src = 0xFF;
@@ -1713,14 +1761,17 @@ static void HarshEventDetected(void)
     harsh_raw_count++;
 
     /* Holdoff stops one rough stretch of road producing a burst of alarms. */
-    if (now - harsh_last_alarm_us <= (int64_t)HARSH_HOLDOFF_S * 1000000LL)
+    if (now - harsh_last_alarm_us <= (int64_t)HARSH_HOLDOFF_S * 1000000LL) {
+        HarshEvLog('H', 0.0f);
         return;
+    }
 
     /* 2.3.57: no trustworthy speed context means no classification. This is
        checked before the min-speed gate below, because that gate reads the same
        history and a fabricated 0 would have failed it for the wrong reason. */
     if (!harsh_speed_trustworthy()) {
         harsh_stale_count++;
+        HarshEvLog('S', 0.0f);
         return;
     }
 
@@ -1730,8 +1781,8 @@ static void HarshEventDetected(void)
 
     /* Below urban pace this is a door slam, a kerb, or someone leaning on the
        vehicle - not driving behaviour. */
-    if (peak < HARSH_MIN_SPEED) return;
-    if (harsh_alarm != 0) return;          /* one alarm pending at a time */
+    if (peak < HARSH_MIN_SPEED) { HarshEvLog('M', spd_now - spd_old); return; }
+    if (harsh_alarm != 0) { HarshEvLog('P', spd_now - spd_old); return; }  /* one alarm pending at a time */
 
     /* 2.3.54: REQUIRE A SPEED SIGNATURE.
        This used to fall through to hardCornering for anything without a speed
@@ -1761,8 +1812,10 @@ static void HarshEventDetected(void)
     else {
         /* No speed signature: the sensor moved but the vehicle did not. */
         harsh_nodelta_count++;
+        HarshEvLog('N', ds);
         return;
     }
+    HarshEvLog(harsh_alarm == 1 ? 'B' : 'A', ds);
     harsh_last_alarm_us = now;
     harsh_event_count++;
     force_ping_now = 1;
@@ -4903,6 +4956,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
            the thing to check after a drive. */
         char h_part[160] = "";
         char lis_part[64] = "";
+        char hev_part[160] = "";   // 2.3.58 (H3) - stays empty when harsh is compiled out
 #ifdef ENABLE_HARSH_DRIVING
         /* ipoll/qpoll added in 2.3.43 - a constant i2src cannot distinguish
            "polling constantly, never fires" from "polled once, never again".
@@ -4934,6 +4988,37 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         /* 2.3.41 diagnostic - see HarshRegReadback(). Temporary: remove once
            the cause of hraw staying 0 is identified. */
         HarshRegReadback(lis_part, sizeof(lis_part));
+
+        /* 2.3.58 (H3): per-event log, format &hev=<uptime_s>:<ds_x10>:<disp>;...
+           Emitted only when events occurred since the last ping, so a quiet
+           unit's pings stay byte-identical to 2.3.57 and nothing has to be
+           re-learned to read them.
+
+           DRAINED, not sticky. Each ping reports only what happened since the
+           last one, which keeps the attribute short and stops one event being
+           counted twice in analysis. The cost is that events are lost if the
+           ping itself fails - accepted deliberately, because hraw/hcnt/hnod/
+           hstl are unaffected and remain the authoritative totals. hevl counts
+           anything the ring could not hold, so a truncated burst announces
+           itself rather than looking like a quiet patch.
+
+           Read it against the track buffer: each t_s converts to a wall-clock
+           second via the ping's own uptime, which is what lets a rejected event
+           be laid over the GPS speed trace and the delta recomputed for any
+           window. That comparison is the entire point of the build. */
+        if (harsh_evlog_n > 0) {
+            int off = snprintf(hev_part, sizeof(hev_part), "&hev=");
+            for (unsigned char i = 0; i < harsh_evlog_n && off > 0 && off < (int)sizeof(hev_part); i++)
+                off += snprintf(hev_part + off, sizeof(hev_part) - off, "%s%lu:%d:%c",
+                                i ? ";" : "",
+                                (unsigned long)harsh_evlog[i].t_s,
+                                (int)harsh_evlog[i].ds_x10,
+                                harsh_evlog[i].disp);
+            if (harsh_evlog_lost && off > 0 && off < (int)sizeof(hev_part))
+                snprintf(hev_part + off, sizeof(hev_part) - off, "&hevl=%lu",
+                         (unsigned long)harsh_evlog_lost);
+            harsh_evlog_n = 0;
+        }
 #endif
         /* Timestamp only for a live GPS fix with a sane date. Cached/cell
            positions previously carried stale (or year-2000) fix times, so
@@ -5004,7 +5089,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
             snprintf(och_part, sizeof(och_part), "&otach=1");
 
         snprintf(str, sizeof(str),
-            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s%s%s%s&fwver=" FW_VERSION,
+            "%s%s?id=%s&lat=%f&lon=%f&speed=%f%s&vbat=%f&ncsq=%s&ignition=%s&uptime=%lu%s%s%s%s%s%s%s%s%s%s&fwver=" FW_VERSION,
             Params.Fields.HTTPURL, _sep, IMEI,
         send_lat, send_lon, pPacket->GEvent.Speed / 1.852f, // OsmAnd speed param is knots
         ts_part,
@@ -5016,6 +5101,7 @@ char XHTTP_Request(char *pFilename, unsigned char pingtype)
         gps_part,
         g_part,
         h_part,
+        hev_part,
         lis_part,
         trk_part,
         ota_part,

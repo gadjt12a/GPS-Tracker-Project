@@ -197,6 +197,34 @@ and moderate braking sit at **0.02–0.09 g**, while the sensor triggers on a 0.
 wrong lever rather than the number**. Blocked on H1 — there is no sound basis for choosing
 either until the history is trustworthy.
 
+**UNBLOCKED 2026-08-19: H1 is confirmed fixed in the field** (van, 2.3.57-rc1, 23 h, four
+alarms all GPS-corroborated, `hstl=5` incrementing only in windows containing a sample gap).
+
+**Why analysis alone cannot close this, and what 2.3.58 adds.** The counters say how many
+events took each exit but never *when*. A ping covers ~31 s against a 2–3 s GPS trace, so a
+rejected event cannot be placed against the speed history it was judged on. Two windows
+from the 08-19 van data show the problem exactly:
+
+| window (NZST) | outcome | peak GPS g in window |
+|---|---|---|
+| 13:52:30–13:53:02 | `hnod` +1 | **0.334 g** (44.2 → 8.8 km/h) |
+| 08:37:15–08:37:47 | `hnod` +1 | 0.196 g (91.3 → 20.1 km/h over ~30 s) |
+
+Either the gate rejected a genuine 0.334 g event — H3 confirmed — or it correctly rejected a
+transient that happened to sit beside one. **The wire data cannot distinguish these**, and no
+amount of re-reading it will.
+
+**2.3.58-rc1 adds `hev`**, a per-event log drained on each ping:
+`&hev=<uptime_s>:<ds_x10>:<disp>;…` with disposition `B`/`A` (alarm), `N` (no delta),
+`S` (stale), `H` (holdoff), `M` (below min speed), `P` (alarm pending). `hevl` counts ring
+overflow. Because each event carries the uptime it fired at, it can be laid over the
+timestamped track buffer and **the true delta recomputed for any window length offline** —
+which answers "is 4 s the wrong window?" from a single drive rather than one staging build
+per candidate value. `H` and `M` were previously invisible; the 08-19 drive had zero of
+both, which is precisely the case that hides a miscount.
+
+Emitted only when events occurred, so quiet pings stay byte-identical to 2.3.57.
+
 ---
 
 ## B. Known / previously documented

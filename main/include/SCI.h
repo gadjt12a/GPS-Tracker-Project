@@ -473,7 +473,7 @@ extern const char *TAG;
 /* 2.3.55 was consumed by the D2 deep-sleep diagnostic (2.3.55-diag1, branch
    diag/deepsleep-fast, staging only, never released). Skipped here so the
    number cannot be confused with a fleet release. */
-#define FW_VERSION          "2.3.57"
+#define FW_VERSION          "2.3.58"
 #define OTA_VERSION_URL     "http://ota.pawson.co.nz/version.json"
 #define OTA_FIRMWARE_URL    "http://ota.pawson.co.nz/firmware.bin"
 
